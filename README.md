@@ -143,9 +143,9 @@ recompiles, and so counts as new, only when the source or build flags change.
 - The image is downloaded into PSRAM and checked with SHA-256 before any flash
   is written. A failed or interrupted transfer leaves the current firmware
   running.
-- Writing flash stalls the panel's PSRAM reads, so the screen can flicker
-  during the short "Installing" step at the end (a few seconds). The download
-  itself shows a steady progress bar.
+- Writing flash stalls the panel's PSRAM reads and makes the picture jump, so
+  the screen shows a short notice and goes dark for that step (a few seconds)
+  before restarting. The download itself shows a steady progress bar.
 - A new image must reach an approved helper within 3 minutes of booting. If
   it doesn't, the display rolls back to the previous firmware. An image that
   hangs very early in boot rolls back on the next power cycle. The helper

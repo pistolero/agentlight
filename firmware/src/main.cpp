@@ -289,11 +289,13 @@ uint32_t lastKey = 0;
 
 bool backlightOn = true;
 void applyScreen() {
-  bool on = power.screenOn();
-  if (on == backlightOn) return;
+  // During an update's flash writes the picture jumps, so keep the screen dark.
+  bool flashing = Ota::phase == Ota::Installing && millis() - Ota::phaseMs >= Ota::DARK_NOTICE_MS;
+  bool on = power.screenOn() && !flashing;
+  if (on == backlightOn) { if (flashing) Ota::flashGo = true; return; }
   auto backlight = board.getBacklight();
   backlightOn = on;
-  if (!on) { if (backlight) backlight->off(); return; }
+  if (!on) { if (backlight) backlight->off(); if (flashing) Ota::flashGo = true; return; }
   // Paint a fresh frame first, so the backlight doesn't reveal a stale picture.
   updatePixelClock();
   render(); lastKey = screenKey(); dirty = false; lastDraw = millis();
@@ -344,7 +346,7 @@ void loop() {
   Ota::checkDeadline();
   if (Ota::phase == Ota::Failed && millis() - Ota::phaseMs > 8000) { Ota::phase = Ota::Idle; dirty = true; }
   if (page && !logView.open && millis() - lastTouch > 30000) { page = 0; dirty = true; }
-  if (!power.screenOn()) { delay(50); return; }  // no drawing or log polling in the dark
+  if (!backlightOn) { delay(50); return; }  // no drawing or log polling in the dark
   if (logView.open && logView.follow && millis() - logView.requestedAt >= 2000) requestLog();
   // Drags redraw at most ~30 fps; otherwise check for visible changes 4x a second.
   uint32_t now = millis();

@@ -95,7 +95,10 @@ static void runOta(NetworkClientSecure &client,uint32_t size,const String &sha,c
   uint8_t diff=0;
   for(int j=0;j<32;j++) {char pair[3]={sha[2*j],sha[2*j+1],0};diff|=digest[j]^strtoul(pair,nullptr,16);}
   if(diff) {abortWith("checksum mismatch");return;}
-  Ota::setPhase(Ota::Installing);
+  // Flash writes block the panel's PSRAM reads and make the picture jump, so the
+  // UI shows a notice and turns the backlight off first. Never wait on it forever.
+  Ota::flashGo=false;Ota::setPhase(Ota::Installing);
+  for(uint32_t t=millis();!Ota::flashGo && millis()-t<4000;) vTaskDelay(pdMS_TO_TICKS(20));
   if(!Update.begin(size,U_FLASH)) {abortWith("cannot prepare flash");return;}
   for(uint32_t off=0;off<size;) {
     size_t n=min<uint32_t>(4096,size-off);

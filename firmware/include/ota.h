@@ -18,6 +18,8 @@ static const char *build() { return AGENTLIGHT_BUILD + 17; }
 enum Phase : uint8_t { Idle, Preparing, Downloading, Verifying, Installing, Restarting, Failed };
 static std::atomic<uint8_t> phase{Idle};
 static std::atomic<uint32_t> received{0}, written{0}, total{0}, startedMs{0}, phaseMs{0};
+static std::atomic<bool> flashGo{false};  // UI has darkened the screen for flash writes
+constexpr uint32_t DARK_NOTICE_MS = 1500;  // how long the notice shows before going dark
 static char newVersion[24] = "";
 static char error[48] = "";
 static bool pendingVerify = false;

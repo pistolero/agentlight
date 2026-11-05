@@ -59,8 +59,8 @@ inline void draw() {
       }
     } else if (phase == Ota::Verifying) { headline = "100%"; detail = "Checking the update..."; }
     else if (phase == Ota::Installing) {
-      headline = String(int(uint64_t(done) * 100 / total)) + "%";
-      detail = "Installing - the screen may flicker for a moment";
+      headline = "Installing";
+      detail = "The screen will go dark for a few seconds";
     } else if (phase == Ota::Restarting) { headline = "Done"; detail = "Restarting with the new firmware..."; }
     else { headline = String(pct) + "%"; detail = canvas.fit(String("Still running v") + FW_VERSION + "  (" + Ota::error + ")", font_s20, 800); }
   }
