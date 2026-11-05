@@ -1,0 +1,38 @@
+{
+  "shell": {
+    "watertight": true,
+    "winding_consistent": true,
+    "components": 1,
+    "bounds_mm": [
+      145.0,
+      105.0,
+      23.0
+    ],
+    "minimum_z": 0.0,
+    "volume_mm3": 62991.621612046496
+  },
+  "bezel": {
+    "watertight": true,
+    "winding_consistent": true,
+    "components": 1,
+    "bounds_mm": [
+      145.0,
+      105.0,
+      2.4
+    ],
+    "minimum_z": 0.0,
+    "volume_mm3": 18369.820207679997
+  },
+  "stand-45": {
+    "watertight": true,
+    "winding_consistent": true,
+    "components": 1,
+    "bounds_mm": [
+      151.0,
+      105.0,
+      60.0
+    ],
+    "minimum_z": 0.0,
+    "volume_mm3": 118748.54846750681
+  }
+}

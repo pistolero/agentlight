@@ -1,0 +1,6 @@
+/target/
+/firmware/.pio/
+/firmware/.dummy/
+/firmware/managed_components/
+/firmware/sdkconfig*
+/firmware/dependencies.lock
