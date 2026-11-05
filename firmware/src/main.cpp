@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <esp_display_panel.hpp>
+#include <esp_lcd_panel_rgb.h>
 #include <vector>
 #include "wifi_link.h"
 #include "app_state.h"
@@ -32,6 +33,21 @@ bool finishBufferSwap() {
   drawBuffer = 1 - drawBuffer; canvas.pixels = panelBuffers[drawBuffer]; return true;
 }
 
+// Pixel clock: refresh = PCLK / (1368 x 637 clocks per frame). The panel and
+// network share PSRAM bandwidth: 14 MHz (~16 Hz) is safe for the Wi-Fi TLS
+// handshake and OTA downloads but visibly shimmers; 21 MHz (~24 Hz) looks
+// steady but stalls the handshake. Run fast, and slow down only while heavy
+// network work is in flight.
+constexpr uint32_t PCLK_SAFE = 14000000, PCLK_FAST = 21000000;
+uint32_t pclk = PCLK_SAFE, lastHeavy = 0;
+void updatePixelClock() {
+  bool heavy = Ota::phase != Ota::Idle || WifiLink::linkState == WifiLink::Connecting;
+  if (heavy) lastHeavy = millis();
+  uint32_t want = heavy || millis() - lastHeavy < 2000 ? PCLK_SAFE : PCLK_FAST;
+  if (want == pclk) return;
+  // Applied by the driver at the next VSYNC, so the picture is not disturbed.
+  if (esp_lcd_rgb_panel_set_pclk(board.getLCD()->getRefreshPanelHandle(), want) == ESP_OK) pclk = want;
+}
 bool dirty = true;
 uint32_t lastDraw = 0, lastTouch = 0, lastUsbState = 0;
 char line[4097]; size_t lineLen = 0; bool overflow = false;
@@ -255,11 +271,10 @@ void setup() {
   // A complete protocol frame can be 4096 bytes; the HWCDC default is only 256.
   Serial.setRxBufferSize(8192);
   if (!board.init()) { while (true) delay(1000); }
-  // The 5B default (21 MHz) can starve RGB DMA when Wi-Fi/TLS and drawing
-  // compete for PSRAM bandwidth. A slower scan plus larger internal bounce
-  // buffers trades refresh rate for a steadier display under network load.
+  // Start at the safe pixel clock; updatePixelClock() raises it once idle.
+  // Larger internal bounce buffers keep the scan steady under network load.
   auto rgb = static_cast<BusRGB *>(board.getLCD()->getBus());
-  if (!rgb->configRGB_FreqHz(14000000) || !rgb->configRGB_BounceBufferSize(WIDTH * 20) || !rgb->configRGB_FrameBufferNumber(2) || !board.begin()) {
+  if (!rgb->configRGB_FreqHz(PCLK_SAFE) || !rgb->configRGB_BounceBufferSize(WIDTH * 20) || !rgb->configRGB_FrameBufferNumber(2) || !board.begin()) {
     Serial.println("RGB initialization failed"); while (true) delay(1000);
   }
   panelBuffers[0] = static_cast<uint16_t *>(board.getLCD()->getFrameBufferByIndex(0));
@@ -284,6 +299,7 @@ void loop() {
   static WifiLink::Frame networkFrame;
   while (WifiLink::receive(networkFrame)) acceptMessage(networkFrame.text, false);
   handleTouch();
+  updatePixelClock();
   Ota::checkDeadline();
   if (Ota::phase == Ota::Failed && millis() - Ota::phaseMs > 8000) { Ota::phase = Ota::Idle; dirty = true; }
   if (page && !logView.open && millis() - lastTouch > 30000) { page = 0; dirty = true; }
