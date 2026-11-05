@@ -38,7 +38,9 @@ inline String kindLabel(const String &kind) {
   String k = kind; if (k.length()) k.setCharAt(0, toupper(k[0])); return k;
 }
 inline String duration(uint32_t s) {
-  if (s < 60) return String(s) + "s";
+  // No seconds: a ticking value would force a full repaint every second, and
+  // repaints compete with the panel scan for PSRAM bandwidth (tearing).
+  if (s < 60) return "<1m";
   if (s < 3600) return String(s / 60) + "m";
   if (s < 86400) return String(s / 3600) + "h " + String((s % 3600) / 60) + "m";
   return String(s / 86400) + "d " + String((s % 86400) / 3600) + "h";

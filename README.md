@@ -53,6 +53,32 @@ page after 30 seconds. Until the first update arrives, and again after six
 seconds without one, a connection screen lists what the display is waiting for
 (Wi-Fi, helper) and how to fix it.
 
+## Sleep mode
+
+Tap the moon in the top bar to save power, for example on a powerbank. The
+screen turns off after 5 minutes without a touch, while the display keeps
+listening for status over USB or Wi-Fi. The mode survives restarts and updates.
+
+- A touch turns the screen back on and does nothing else. The 5 minutes then
+  start again, and the mode stays on.
+- When a session newly needs you (NEEDS YOU or ERROR), the screen turns on, any
+  open log closes, and the moon becomes an amber **Sleep** button. The screen
+  then stays on, even if you touch it, until that session's status changes or
+  you tap **Sleep**. Either way the 5 minutes start again.
+- Sessions already needing you when you turn the mode on, or when you tap
+  **Sleep**, don't wake the screen unless they leave that status and return.
+- To leave the mode, tap the highlighted moon. During an alert that takes two
+  taps: **Sleep**, then the moon.
+
+Claude Code and OpenCode sessions report NEEDS YOU for 2 hours after going idle,
+then IDLE, so an alert nobody answers ends by itself after up to 2 hours. A
+newly started session also counts, because it's waiting for you.
+
+**A dark screen doesn't prove the helper is connected.** If the helper is lost
+while the screen is off, it stays off to save power, and a touch shows the
+connection screen. Sessions that started needing you meanwhile wake the screen
+when the helper reconnects.
+
 ## Wi-Fi: setup requires explicit approval
 
 The board supports **2.4 GHz Wi-Fi**. Initial setup is over a trusted physical

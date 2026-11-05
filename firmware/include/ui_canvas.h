@@ -198,6 +198,11 @@ public:
     stroke(cx - s, cy - s / 2.f, cx, cy + s / 2.f, 2.6f, color);
     stroke(cx, cy + s / 2.f, cx + s, cy - s / 2.f, 2.6f, color);
   }
+  // Crescent: a disc with an offset disc of the background color on top.
+  void moon(int cx, int cy, float r, uint16_t color, uint16_t bg) {
+    fillCircle(cx, cy, r, color);
+    fillCircle(cx + r * 0.5f, cy - r * 0.35f, r * 0.85f, bg);
+  }
   // Brand mark: three overlapping status lights.
   void logo(int cx, int cy, int r) {
     fillCircle(cx - r * 0.9f, cy, r, Theme::WORKING, 230);

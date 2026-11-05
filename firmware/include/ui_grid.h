@@ -39,6 +39,19 @@ inline void topBar() {
   int iconX = right - canvas.textWidth(clock, font_s20) - 26;
   if (usingWifi) canvas.wifiIcon(iconX, BAR / 2 + 8, 16, TEXT2);
   else canvas.usbIcon(iconX, BAR / 2, 18, TEXT2);
+
+  // Sleep control: tap to activate; during an alert, tap to go back to sleep.
+  int sleepRight = iconX - 22;
+  if (power.alerting()) {
+    int w = canvas.pillWidth("Sleep", font_s16, 32, false);
+    canvas.pill(sleepRight - w, (BAR - 32) / 2, "Sleep", font_s16, BG, WAITING, 32);
+    addHit(sleepRight - w - 8, 0, w + 16, BAR, ToggleSleep);
+  } else {
+    int cx = sleepRight - 18;
+    if (power.active()) { canvas.fillCircle(cx, BAR / 2, 18, RAISED); canvas.moon(cx, BAR / 2, 10, DONE, RAISED); }
+    else canvas.moon(cx, BAR / 2, 10, TEXT3, BG);
+    addHit(cx - 28, 0, 56, BAR, ToggleSleep);
+  }
   canvas.fillRect(0, BAR, WIDTH, 1, DIVIDER);
 }
 
@@ -126,6 +139,7 @@ inline String clockText() {
 }
 inline uint32_t key() {
   FrameKey k; k.add(1u);
+  k.add(uint32_t(power.active())); k.add(uint32_t(power.alerting()));
   k.add(uint32_t(page)); k.add(uint32_t(agentCount)); k.add(uint32_t(moreAgents)); k.add(uint32_t(usingWifi)); k.add(clockText());
   for (int i = page * PAGE_SIZE; i < min(agentCount, (page + 1) * PAGE_SIZE); i++) {
     const Agent &a = agents[i];

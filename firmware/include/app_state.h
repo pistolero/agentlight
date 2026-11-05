@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <vector>
 #include "ui_canvas.h"
+#include "power_mode.h"
 
 // Data model shared by the protocol parser, input handling and screens.
 constexpr int MAX_AGENTS = 24, PAGE_SIZE = 9, MAX_CHILDREN = 6;
@@ -16,6 +17,7 @@ struct Agent {
 };
 
 inline Canvas canvas;
+inline PowerMode power;
 inline Agent agents[MAX_AGENTS];
 inline int agentCount = 0, moreAgents = 0, page = 0;
 inline uint32_t receivedAt = 0;
@@ -36,7 +38,7 @@ inline const Child *findChild(const Agent *a, const String &id) {
 }
 
 // Tap targets, rebuilt by every render. Later entries sit on top.
-enum Action : uint8_t { OpenAgent, OpenChild, NextPage, PrevPage, Back, Follow };
+enum Action : uint8_t { OpenAgent, OpenChild, NextPage, PrevPage, Back, Follow, ToggleSleep };
 struct Hit { int16_t x, y, w, h; uint8_t action; int8_t agent, child; };
 inline Hit hits[96];
 inline int hitCount = 0;

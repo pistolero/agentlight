@@ -36,14 +36,16 @@ bool finishBufferSwap() {
 // Pixel clock: refresh = PCLK / (1368 x 637 clocks per frame). The panel and
 // network share PSRAM bandwidth: 14 MHz (~16 Hz) is safe for the Wi-Fi TLS
 // handshake and OTA downloads but visibly shimmers; 21 MHz (~24 Hz) looks
-// steady but stalls the handshake. Run fast, and slow down only while heavy
-// network work is in flight.
+// steady. 18 MHz builds failed to log in over Wi-Fi at least intermittently
+// (0.4.2 twice; 0.5.2 once, then it connected), reason unknown. Run fast, and
+// slow down only while heavy network work is in flight.
 constexpr uint32_t PCLK_SAFE = 14000000, PCLK_FAST = 21000000;
+constexpr uint32_t PCLK_SLEEP = 8000000;  // nobody can see the scan with the backlight off
 uint32_t pclk = PCLK_SAFE, lastHeavy = 0;
 void updatePixelClock() {
   bool heavy = Ota::phase != Ota::Idle || WifiLink::linkState == WifiLink::Connecting;
   if (heavy) lastHeavy = millis();
-  uint32_t want = heavy || millis() - lastHeavy < 2000 ? PCLK_SAFE : PCLK_FAST;
+  uint32_t want = !power.screenOn() ? PCLK_SLEEP : heavy || millis() - lastHeavy < 2000 ? PCLK_SAFE : PCLK_FAST;
   if (want == pclk) return;
   // Applied by the driver at the next VSYNC, so the picture is not disturbed.
   if (esp_lcd_rgb_panel_set_pclk(board.getLCD()->getRefreshPanelHandle(), want) == ESP_OK) pclk = want;
@@ -163,6 +165,9 @@ bool parseState(JsonObjectConst root) {
   agentCount = n;
   moreAgents = root["more"] | 0; hostTime = root["now"].as<uint64_t>(); tzOffset = root["tz"] | 0;
   receivedAt = millis(); everConnected = true;  // redraws follow from screenKey() changes
+  std::vector<AgentStatus> statuses;
+  for (int i = 0; i < n; i++) statuses.push_back({agents[i].id.c_str(), agents[i].status.c_str()});
+  if (power.statuses(statuses, receivedAt)) closeLog();
   return true;
 }
 void acceptMessage(const char *message, bool usb) {
@@ -185,7 +190,12 @@ void acceptMessage(const char *message, bool usb) {
 }
 
 // ---------------------------------------------------------------- input
-struct TouchState { bool down = false, dragging = false; int x0 = 0, y0 = 0, x = 0, y = 0, scroll0 = 0, empty = 0; } touch;
+struct TouchState { bool down = false, dragging = false; int x0 = 0, y0 = 0, x = 0, y = 0, scroll0 = 0, empty = 0; bool ignore = false; } touch;
+
+void saveSleepMode() {
+  Preferences prefs;
+  if (prefs.begin("agentlight", false)) { prefs.putBool("sleep", power.active()); prefs.end(); }
+}
 
 void act(const Hit &h) {
   int pages = pageCount();
@@ -196,6 +206,12 @@ void act(const Hit &h) {
     case PrevPage: page = (page + pages - 1) % pages; break;
     case Back: closeLog(); break;
     case Follow: logView.follow = true; logView.scroll = logMaxScroll(); requestLog(); break;
+    case ToggleSleep: {
+      bool was = power.active();
+      power.toggle(millis());
+      if (power.active() != was) saveSleepMode();
+      break;
+    }
   }
   dirty = true;
 }
@@ -215,9 +231,14 @@ void handleTouch() {
   if (!points.empty()) {
     int x = points[0].x, y = points[0].y;
     touch.empty = 0;
-    if (!touch.down) { touch = {true, false, x, y, x, y, logView.scroll, 0}; return; }
+    if (!touch.down) {
+      // A touch that wakes the screen does nothing else, through to its release.
+      bool wokeOnly = power.touch(millis());
+      touch = {true, false, x, y, x, y, logView.scroll, 0, wokeOnly};
+      return;
+    }
     touch.x = x; touch.y = y;
-    if (Ota::phase != Ota::Idle) return;
+    if (touch.ignore || Ota::phase != Ota::Idle) return;
     if (logView.open && !touch.dragging && touch.y0 > LOG_TOP && abs(y - touch.y0) > 12) { touch.dragging = true; logView.follow = false; }
     if (touch.dragging) {
       int scroll = constrain(touch.scroll0 - (y - touch.y0), 0, logMaxScroll());
@@ -228,7 +249,8 @@ void handleTouch() {
   // Require two empty polls so a dropped sample isn't taken as a release.
   if (!touch.down || ++touch.empty < 2) return;
   touch.down = false; lastTouch = millis();
-  if (Ota::phase != Ota::Idle) return;
+  power.touch(lastTouch);  // the countdown runs from the end of the touch
+  if (touch.ignore || Ota::phase != Ota::Idle) return;
   if (touch.dragging) {
     touch.dragging = false;
     if (logView.scroll >= logMaxScroll() - 4) { logView.follow = true; requestLog(); }
@@ -265,8 +287,24 @@ uint32_t screenKey() {
 }
 uint32_t lastKey = 0;
 
+bool backlightOn = true;
+void applyScreen() {
+  bool on = power.screenOn();
+  if (on == backlightOn) return;
+  auto backlight = board.getBacklight();
+  backlightOn = on;
+  if (!on) { if (backlight) backlight->off(); return; }
+  // Paint a fresh frame first, so the backlight doesn't reveal a stale picture.
+  updatePixelClock();
+  render(); lastKey = screenKey(); dirty = false; lastDraw = millis();
+  if (backlight) backlight->on();
+}
+
 void setup() {
   Ota::begin();
+  { Preferences prefs; bool sleep = false;
+    if (prefs.begin("agentlight", true)) { sleep = prefs.getBool("sleep", false); prefs.end(); }
+    power.restore(sleep, millis()); }
   Serial.begin(115200);
   // A complete protocol frame can be 4096 bytes; the HWCDC default is only 256.
   Serial.setRxBufferSize(8192);
@@ -299,10 +337,14 @@ void loop() {
   static WifiLink::Frame networkFrame;
   while (WifiLink::receive(networkFrame)) acceptMessage(networkFrame.text, false);
   handleTouch();
+  if (Ota::phase != Ota::Idle) power.touch(millis());  // an update always shows its progress
+  power.tick(millis());
+  applyScreen();
   updatePixelClock();
   Ota::checkDeadline();
   if (Ota::phase == Ota::Failed && millis() - Ota::phaseMs > 8000) { Ota::phase = Ota::Idle; dirty = true; }
   if (page && !logView.open && millis() - lastTouch > 30000) { page = 0; dirty = true; }
+  if (!power.screenOn()) { delay(50); return; }  // no drawing or log polling in the dark
   if (logView.open && logView.follow && millis() - logView.requestedAt >= 2000) requestLog();
   // Drags redraw at most ~30 fps; otherwise check for visible changes 4x a second.
   uint32_t now = millis();

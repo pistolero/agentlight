@@ -185,8 +185,9 @@ static void begin() {
       settings.fingerprint=doc["fingerprint"] | "";settings.token=doc["token"] | "";
     }
   }
-  // Keep TLS/discovery work off the Arduino UI core, where the panel ISR is
-  // installed during board.begin().
-  xTaskCreatePinnedToCore(task,"agentlight-wifi",20480,nullptr,1,nullptr,0);
+  // Run on the same core as the panel ISR, so the ISR's PSRAM copy pre-empts
+  // TLS work instead of racing it for the shared bus and cache from the other
+  // core. Priority 1 matches the Arduino loop, so they share time slices.
+  xTaskCreatePinnedToCore(task,"agentlight-wifi",20480,nullptr,1,nullptr,1);
 }
 }
