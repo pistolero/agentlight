@@ -202,9 +202,13 @@ This is a first implementation, not full managents parity:
 - Codex: live processes, the latest thread for the working directory, and
   task events in the end of its rollout. Saved session names (or titles on older
   versions) are displayed as the activity line. Internal subagent threads are
-  excluded from this selection. Approval prompts are not detected,
-  and a stale prior rollout can give a misleading status. Context usage is
-  not sent by the helper yet; Codex subagent detection is not implemented.
+  excluded from this selection. Direct subworkers are linked by their recorded
+  parent thread, including workers in other worktrees. Their task names and
+  rollout lifecycle events supply the child labels and running/completed status;
+  completed, interrupted and failed workers expire after two minutes.
+  Approval prompts are not detected, and a stale prior rollout can give a
+  misleading status. Context usage is
+  not sent by the helper yet.
 
 Agent data formats change; unreadable or unavailable sources fall back to a
 waiting card where possible. The helper reads metadata from local state. By
@@ -217,8 +221,9 @@ Full paths are not sent.
 **Tapping a session explicitly requests its recent messages, which then go over
 USB and are visible on the screen.** Excerpts can contain sensitive user or
 assistant text; there is no automatic secret redaction. Reasoning blocks and
-tool arguments/results are omitted. The Codex rollout reader loads up to
-256 KiB of a local file in memory, but doesn't forward its contents. Environment variables
+tool arguments/results are omitted. Codex status detection scans backwards in
+256 KiB chunks for lifecycle events; log excerpts read only the last 256 KiB.
+Environment variables
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_DATA_HOME` select data directories.
 
 The firmware accepts the subset of the [managents v1 protocol](https://github.com/tonylook/managents/blob/main/docs/protocol.md)
@@ -241,8 +246,8 @@ text/tool-name entries that fit one 4 KB frame; an oldest entry that does not
 fit is trimmed at its start and marked `...`. Common Unicode punctuation is
 converted to ASCII for the display font. Claude Code sessions and subagents and
 OpenCode 2 tabs and child sessions are supported; Codex uses the same
-latest-thread-per-folder selection as its status detector and has no subagent
-logs. Unavailable sources show an explanation. Nothing is read for a log until
+latest-thread-per-folder selection as its status detector and supports direct
+subworker logs. Unavailable sources show an explanation. Nothing is read for a log until
 requested, and device requests must identify a currently sent session or
 subagent.
 

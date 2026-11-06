@@ -1,5 +1,5 @@
 //! On-demand display excerpts; never include reasoning blocks or tool payloads.
-use crate::{codex_thread, env_path, home, open_db, Claude, State};
+use crate::{codex_child_threads, codex_db, codex_thread, env_path, home, open_db, Claude, State};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -185,10 +185,26 @@ fn claude_file(root: &Path, relative: &Path) -> Option<PathBuf> {
         .map(|e| e.path().join(relative))
         .find(|p| p.is_file())
 }
-fn codex(pid: u32) -> Option<Vec<Entry>> {
+fn codex_child_entries(db: &rusqlite::Connection, parent: &str, child: &str) -> Option<Vec<Entry>> {
+    if !safe(child) {
+        return None;
+    }
+    let thread = codex_child_threads(db, parent)
+        .into_iter()
+        .find(|c| c.thread.id == child)?
+        .thread;
+    transcript(&thread.rollout_path, false)
+}
+fn codex(pid: u32, child: Option<&str>) -> Option<Vec<Entry>> {
     let cwd = fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
     let thread = codex_thread(cwd.to_string_lossy().as_ref())?;
-    transcript(&thread.rollout_path, false)
+    match child {
+        None => transcript(&thread.rollout_path, false),
+        Some(child) => {
+            let root = env_path("CODEX_HOME", home().join(".codex"));
+            codex_child_entries(&codex_db(&root)?, &thread.id, child)
+        }
+    }
 }
 /// Recent conversation entries for an agent, or for one of its subagents.
 pub fn entries(id: &str, child: Option<&str>) -> Option<Vec<Entry>> {
@@ -218,7 +234,7 @@ pub fn entries(id: &str, child: Option<&str>) -> Option<Vec<Entry>> {
         .strip_prefix("codex:")
         .and_then(|p| p.parse::<u32>().ok())
     {
-        child.is_none().then(|| codex(pid)).flatten()
+        codex(pid, child)
     } else {
         None
     }
@@ -407,6 +423,36 @@ mod tests {
         )).unwrap();
         assert_eq!(transcript(&path, true).unwrap().len(), 2);
         assert!(transcript(&path, false).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn codex_worker_logs_are_scoped_to_the_parent() {
+        let dir = std::env::temp_dir().join(format!("agentlight-codex-log-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("worker.jsonl");
+        fs::write(&path, concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Inspect controllers"}]}}"#, "\n",
+            r#"{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"private reasoning"}]}}"#, "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Controllers fixed"}]}}"#, "\n",
+        )).unwrap();
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, rollout_path TEXT, source TEXT, title TEXT, name TEXT, archived INTEGER, updated_at INTEGER, created_at INTEGER);").unwrap();
+        let source = json!({"subagent":{"thread_spawn":{"parent_thread_id":"parent","agent_path":"/root/controllers"}}});
+        db.execute(
+            "INSERT INTO threads VALUES ('worker',?1,?2,'','',0,1000,1000)",
+            rusqlite::params![path.to_str().unwrap(), source.to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            codex_child_entries(&db, "parent", "worker").unwrap(),
+            vec![
+                (Role::User, "Inspect controllers".into()),
+                (Role::Assistant, "Controllers fixed".into()),
+            ]
+        );
+        assert!(codex_child_entries(&db, "other-parent", "worker").is_none());
+        assert!(codex_child_entries(&db, "parent", "missing").is_none());
+        assert!(codex_child_entries(&db, "parent", "../worker").is_none());
         fs::remove_dir_all(dir).unwrap();
     }
 }

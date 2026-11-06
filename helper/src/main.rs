@@ -551,6 +551,7 @@ struct RolloutPayload {
 }
 
 struct CodexThread {
+    id: String,
     rollout_path: PathBuf,
     title: Option<String>,
 }
@@ -559,6 +560,25 @@ fn codex_thread(dir: &str) -> Option<CodexThread> {
     codex_thread_at(&root, dir)
 }
 fn codex_thread_at(root: &Path, dir: &str) -> Option<CodexThread> {
+    let db = codex_db(root)?;
+    // Newer Codex databases keep the displayed session name separately from
+    // the initial prompt in title. Internal subagent threads are not cards.
+    let scope = "FROM threads WHERE cwd=?1 AND archived=0 AND source NOT IN ('exec','mcp') AND source NOT LIKE '%\"subagent\"%' ORDER BY updated_at DESC,created_at DESC LIMIT 1";
+    let named =
+        format!("SELECT id, rollout_path, coalesce(nullif(trim(name),''),title,'') {scope}");
+    let legacy = format!("SELECT id, rollout_path, coalesce(title,'') {scope}");
+    let mut query = db.prepare(&named).or_else(|_| db.prepare(&legacy)).ok()?;
+    query
+        .query_row([dir], |r| {
+            Ok(CodexThread {
+                id: r.get(0)?,
+                rollout_path: PathBuf::from(r.get::<_, String>(1)?),
+                title: activity(&r.get::<_, String>(2)?),
+            })
+        })
+        .ok()
+}
+fn codex_db(root: &Path) -> Option<Connection> {
     let dbpath = fs::read_dir(root)
         .into_iter()
         .flatten()
@@ -574,59 +594,160 @@ fn codex_thread_at(root: &Path, dir: &str) -> Option<CodexThread> {
         })
         .max_by_key(|(version, _)| *version)
         .map(|(_, p)| p);
-    let db = dbpath.as_deref().and_then(open_db)?;
-    // Newer Codex databases keep the displayed session name separately from
-    // the initial prompt in title. Internal subagent threads are not cards.
-    let scope = "FROM threads WHERE cwd=?1 AND archived=0 AND source NOT IN ('exec','mcp') AND source NOT LIKE '%\"subagent\"%' ORDER BY updated_at DESC,created_at DESC LIMIT 1";
-    let named = format!("SELECT rollout_path, coalesce(nullif(trim(name),''),title,'') {scope}");
-    let legacy = format!("SELECT rollout_path, coalesce(title,'') {scope}");
-    let mut query = db.prepare(&named).or_else(|_| db.prepare(&legacy)).ok()?;
-    query
-        .query_row([dir], |r| {
-            Ok(CodexThread {
-                rollout_path: PathBuf::from(r.get::<_, String>(0)?),
-                title: activity(&r.get::<_, String>(1)?),
-            })
-        })
-        .ok()
+    dbpath.as_deref().and_then(open_db)
 }
-fn codex_status(path: &Path) -> (String, u64) {
-    let Ok(mut file) = fs::File::open(path) else {
-        return ("waiting".into(), 0);
+struct CodexChildThread {
+    thread: CodexThread,
+    label: String,
+    archived: bool,
+    updated: u64,
+}
+fn codex_child_threads(db: &Connection, parent: &str) -> Vec<CodexChildThread> {
+    // The source metadata records the direct parent even for workers in other
+    // worktrees. The spawn-edge status can stay open after a worker finishes.
+    let scope = "FROM threads WHERE CASE WHEN json_valid(source) THEN json_extract(source,'$.subagent.thread_spawn.parent_thread_id') END = ?1 ORDER BY updated_at DESC,created_at DESC";
+    let named = format!("SELECT id, rollout_path, source, coalesce(nullif(trim(name),''),title,''), archived, updated_at {scope}");
+    let legacy = format!(
+        "SELECT id, rollout_path, source, coalesce(title,''), archived, updated_at {scope}"
+    );
+    let Ok(mut query) = db.prepare(&named).or_else(|_| db.prepare(&legacy)) else {
+        return vec![];
     };
-    let _ = file.seek(SeekFrom::End(-262144));
-    let mut tail = String::new();
-    if file.read_to_string(&mut tail).is_err() {
-        return ("waiting".into(), 0);
-    }
-    for line in tail.lines().rev() {
-        let Ok(event) = serde_json::from_str::<RolloutEvent>(line) else {
+    let Ok(rows) = query.query_map([parent], |r| {
+        let source: String = r.get(2)?;
+        let source: serde_json::Value = serde_json::from_str(&source).unwrap_or_default();
+        let spawn = &source["subagent"]["thread_spawn"];
+        let title = activity(&r.get::<_, String>(3)?);
+        let task = spawn["agent_path"]
+            .as_str()
+            .and_then(|p| Path::new(p).file_name())
+            .and_then(|p| p.to_str())
+            .and_then(activity);
+        let label = title
+            .clone()
+            .or(task)
+            .or_else(|| spawn["agent_nickname"].as_str().and_then(activity))
+            .or_else(|| spawn["agent_role"].as_str().and_then(activity))
+            .unwrap_or_else(|| "Subagent".into());
+        Ok(CodexChildThread {
+            thread: CodexThread {
+                id: r.get(0)?,
+                rollout_path: PathBuf::from(r.get::<_, String>(1)?),
+                title,
+            },
+            label,
+            archived: r.get(4)?,
+            updated: r.get(5)?,
+        })
+    }) else {
+        return vec![];
+    };
+    rows.flatten().collect()
+}
+fn codex_children(parent: &str) -> Vec<Child> {
+    let root = env_path("CODEX_HOME", home().join(".codex"));
+    let Some(db) = codex_db(&root) else {
+        return vec![];
+    };
+    codex_children_at(&db, parent, now())
+}
+fn codex_children_at(db: &Connection, parent: &str, at: u64) -> Vec<Child> {
+    let mut children = Vec::new();
+    for child in codex_child_threads(db, parent) {
+        let state = if child.archived {
+            Some(("done", at.saturating_sub(child.updated)))
+        } else {
+            codex_rollout_status(&child.thread.rollout_path, at)
+        };
+        let Some((status, age)) = state else {
             continue;
         };
-        if event.kind != "event_msg" {
+        if status != "working" && age > 120 {
             continue;
         }
-        let status = match event.payload.kind.as_str() {
-            "task_started" => "working",
-            "task_complete" if event.payload.error.is_some() => "error",
-            "task_complete" | "turn_aborted" => "waiting",
-            _ => continue,
-        };
-        let age = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
-            .ok()
-            .map(|t| now().saturating_sub(t.timestamp().max(0) as u64))
-            .unwrap_or(0);
-        return (
-            (if status != "working" && age >= 7200 {
-                "idle"
-            } else {
-                status
-            })
-            .into(),
+        children.push(Child {
+            id: limit_text(&child.thread.id, 48),
+            name: child_name(&child.label, "Subagent"),
+            status: status.into(),
             age,
-        );
+            activity: activity(&child.label),
+        });
     }
-    ("waiting".into(), 0)
+    // Active workers must not be displaced by recently completed siblings.
+    children.sort_by(|a, b| (a.status != "working", &a.id).cmp(&(b.status != "working", &b.id)));
+    children.truncate(6);
+    children
+}
+fn codex_rollout_status(path: &Path, at: u64) -> Option<(&'static str, u64)> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut cursor = file.metadata().ok()?.len();
+    let mut line_end = cursor;
+    // A long tool result can push task_started out of the last chunk. Scan
+    // backwards until a lifecycle event is found, retaining at most one chunk.
+    while cursor > 0 {
+        let chunk_start = cursor.saturating_sub(262144);
+        file.seek(SeekFrom::Start(chunk_start)).ok()?;
+        let mut bytes = vec![0; (cursor - chunk_start) as usize];
+        file.read_exact(&mut bytes).ok()?;
+        let starts = bytes
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, b)| **b == b'\n')
+            .map(|(i, _)| chunk_start + i as u64 + 1)
+            .chain((chunk_start == 0).then_some(0));
+        for start in starts {
+            if start < line_end {
+                let event = if line_end <= cursor {
+                    serde_json::from_slice::<RolloutEvent>(
+                        &bytes[(start - chunk_start) as usize..(line_end - chunk_start) as usize],
+                    )
+                } else {
+                    // Stream a line spanning chunks; serde skips tool payloads
+                    // and message bodies without retaining those strings.
+                    file.seek(SeekFrom::Start(start)).ok()?;
+                    serde_json::from_reader::<_, RolloutEvent>(std::io::BufReader::new(
+                        (&mut file).take(line_end - start),
+                    ))
+                };
+                if let Ok(event) = event {
+                    if let Some(status) = codex_lifecycle(event, at) {
+                        return Some(status);
+                    }
+                }
+            }
+            line_end = start.saturating_sub(1);
+        }
+        cursor = chunk_start;
+    }
+    None
+}
+fn codex_lifecycle(event: RolloutEvent, at: u64) -> Option<(&'static str, u64)> {
+    if event.kind != "event_msg" {
+        return None;
+    }
+    let status = match event.payload.kind.as_str() {
+        "task_started" => "working",
+        "task_complete" if event.payload.error.is_some() => "error",
+        "task_complete" | "turn_aborted" => "done",
+        _ => return None,
+    };
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&event.timestamp).ok()?;
+    Some((
+        status,
+        at.saturating_sub(timestamp.timestamp().max(0) as u64),
+    ))
+}
+fn codex_status(path: &Path) -> (String, u64) {
+    let (status, age) = codex_rollout_status(path, now()).unwrap_or(("waiting", 0));
+    let status = if status != "working" && age >= 7200 {
+        "idle"
+    } else if status == "done" {
+        "waiting"
+    } else {
+        status
+    };
+    (status.into(), age)
 }
 
 #[derive(Deserialize)]
@@ -752,10 +873,13 @@ fn process_sessions() -> Vec<Agent> {
             id: format!("{executable}:{pid}"),
             kind: executable.into(),
             name: name(&dir),
+            children: codex
+                .as_ref()
+                .map(|thread| codex_children(&thread.id))
+                .unwrap_or_default(),
             activity: codex.and_then(|thread| thread.title),
             status,
             age,
-            children: vec![],
             tasks: None,
         });
     }
@@ -1057,8 +1181,8 @@ mod tests {
             std::env::temp_dir().join(format!("agentlight-codex-test-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         let legacy = Connection::open(root.join("state_4.sqlite")).unwrap();
-        legacy.execute_batch("CREATE TABLE threads (cwd TEXT, rollout_path TEXT, title TEXT, source TEXT, archived INTEGER, updated_at INTEGER, created_at INTEGER);
-            INSERT INTO threads VALUES ('/project','legacy.jsonl','Legacy title','cli',0,100,100);").unwrap();
+        legacy.execute_batch("CREATE TABLE threads (id TEXT, cwd TEXT, rollout_path TEXT, title TEXT, source TEXT, archived INTEGER, updated_at INTEGER, created_at INTEGER);
+            INSERT INTO threads VALUES ('legacy','/project','legacy.jsonl','Legacy title','cli',0,100,100);").unwrap();
         drop(legacy);
         assert_eq!(
             codex_thread_at(&root, "/project").unwrap().title.as_deref(),
@@ -1066,8 +1190,8 @@ mod tests {
         );
 
         let db = Connection::open(root.join("state_5.sqlite")).unwrap();
-        db.execute_batch("CREATE TABLE threads (cwd TEXT, rollout_path TEXT, title TEXT, name TEXT, source TEXT, archived INTEGER, updated_at INTEGER, created_at INTEGER);
-            INSERT INTO threads VALUES ('/project','current.jsonl','Original prompt','Fix subagent count mismatch','vscode',0,10,10);").unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, cwd TEXT, rollout_path TEXT, title TEXT, name TEXT, source TEXT, archived INTEGER, updated_at INTEGER, created_at INTEGER);
+            INSERT INTO threads VALUES ('current','/project','current.jsonl','Original prompt','Fix subagent count mismatch','vscode',0,10,10);").unwrap();
         for (cwd, source, archived) in [
             ("/other", "cli", 0),
             ("/project", "cli", 1),
@@ -1075,7 +1199,7 @@ mod tests {
             ("/project", "mcp", 0),
             ("/project", r#"{"subagent":{"other":"guardian"}}"#, 0),
         ] {
-            db.execute("INSERT INTO threads VALUES (?1,'internal.jsonl','Internal title','Internal name',?2,?3,20,20)", rusqlite::params![cwd, source, archived]).unwrap();
+            db.execute("INSERT INTO threads VALUES ('internal',?1,'internal.jsonl','Internal title','Internal name',?2,?3,20,20)", rusqlite::params![cwd, source, archived]).unwrap();
         }
         let thread = codex_thread_at(&root, "/project").unwrap();
         assert_eq!(thread.title.as_deref(), Some("Fix subagent count mismatch"));
@@ -1100,6 +1224,127 @@ mod tests {
         assert!(codex_thread_at(&root, "/missing").is_none());
         drop(db);
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn codex_workers_follow_direct_parent_and_latest_lifecycle() {
+        let root =
+            std::env::temp_dir().join(format!("agentlight-workers-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let db = Connection::open_in_memory().unwrap();
+        // Older databases have no saved name or spawn-edge table.
+        db.execute_batch("CREATE TABLE threads (id TEXT, rollout_path TEXT, source TEXT, title TEXT, archived INTEGER, updated_at INTEGER, created_at INTEGER);").unwrap();
+        let insert = |id: &str,
+                      parent: &str,
+                      kind: &str,
+                      timestamp: u64,
+                      archived: bool,
+                      updated: u64| {
+            let source = serde_json::json!({"subagent":{"thread_spawn":{
+                "parent_thread_id":parent,"agent_path":format!("/root/{id}"),"agent_nickname":"Worker nickname"
+            }}});
+            let path = root.join(format!("{id}.jsonl"));
+            let event = serde_json::json!({
+                "timestamp":chrono::DateTime::from_timestamp(timestamp as i64,0).unwrap().to_rfc3339(),
+                "type":"event_msg","payload":{"type":kind,"error":if id == "failed" { serde_json::json!({"message":"failed"}) } else { serde_json::Value::Null }}
+            });
+            fs::write(&path, format!("{{broken\n{event}\n")).unwrap();
+            db.execute(
+                "INSERT INTO threads VALUES (?1,?2,?3,'',?4,?5,700)",
+                rusqlite::params![
+                    id,
+                    path.to_str().unwrap(),
+                    source.to_string(),
+                    archived,
+                    updated
+                ],
+            )
+            .unwrap();
+        };
+        insert("working", "parent", "task_started", 800, false, 1000);
+        insert("done", "parent", "task_complete", 1000, false, 1000);
+        insert("failed", "parent", "task_complete", 1000, false, 1000);
+        insert("aborted", "parent", "turn_aborted", 1000, false, 1000);
+        insert("archived", "parent", "task_started", 800, true, 1000);
+        insert("old-done", "parent", "task_complete", 999, false, 1120);
+        insert("old-archived", "parent", "task_started", 800, true, 999);
+        insert("other-parent", "other", "task_started", 1000, false, 1000);
+        insert("grandchild", "working", "task_started", 1000, false, 1000);
+        insert("unstarted", "parent", "token_count", 1000, false, 1000);
+        // Invalid sources and automatic reviews must not become workers.
+        for source in ["cli", "{bad", r#"{"subagent":{"other":"guardian"}}"#] {
+            db.execute(
+                "INSERT INTO threads VALUES ('internal','missing',?1,'',0,1120,700)",
+                [source],
+            )
+            .unwrap();
+        }
+        let recent = codex_children_at(&db, "parent", 1120);
+        assert_eq!(recent.len(), 5);
+        assert_eq!(recent[0].id, "working");
+        assert_eq!(recent[0].name, "working");
+        assert_eq!(recent[0].status, "working");
+        assert_eq!(recent[0].age, 320);
+        for child in &recent[1..] {
+            assert_eq!(child.age, 120);
+            assert_eq!(
+                child.status,
+                if child.id == "failed" {
+                    "error"
+                } else {
+                    "done"
+                }
+            );
+        }
+        let expired = codex_children_at(&db, "parent", 1121);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, "working");
+        // A follow-up turn on the same worker makes it active again.
+        let resumed = serde_json::json!({"timestamp":"1970-01-01T00:18:30Z","type":"event_msg","payload":{"type":"task_started"}});
+        fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("done.jsonl"))
+            .unwrap()
+            .write_all(format!("{resumed}\n").as_bytes())
+            .unwrap();
+        assert!(codex_children_at(&db, "parent", 1121)
+            .iter()
+            .any(|c| c.id == "done" && c.status == "working" && c.age == 11));
+        // Completed workers cannot crowd active workers out of the six pills.
+        for i in 0..6 {
+            insert(
+                &format!("active-{i}"),
+                "parent",
+                "task_started",
+                1000,
+                false,
+                1000,
+            );
+        }
+        let capped = codex_children_at(&db, "parent", 1120);
+        assert_eq!(capped.len(), 6);
+        assert!(capped.iter().all(|c| c.status == "working"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn codex_lifecycle_survives_large_tool_results_and_completion_lines() {
+        let path =
+            std::env::temp_dir().join(format!("agentlight-lifecycle-{}.jsonl", std::process::id()));
+        let started = r#"{"timestamp":"1970-01-01T00:16:40Z","type":"event_msg","payload":{"type":"task_started"}}"#;
+        let output = serde_json::json!({"timestamp":"1970-01-01T00:16:41Z","type":"response_item","payload":{"type":"function_call_output","output":"é".repeat(300000)}});
+        fs::write(&path, format!("{started}\n{output}\n")).unwrap();
+        assert_eq!(codex_rollout_status(&path, 1120), Some(("working", 120)));
+        let complete = serde_json::json!({"timestamp":"1970-01-01T00:18:20Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Done. ".repeat(60000)}});
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("{complete}\n{{partial").as_bytes())
+            .unwrap();
+        assert_eq!(codex_rollout_status(&path, 1120), Some(("done", 20)));
+        // The first event is also valid when the file has no trailing newline.
+        fs::write(&path, started).unwrap();
+        assert_eq!(codex_rollout_status(&path, 1120), Some(("working", 120)));
+        fs::remove_file(path).unwrap();
     }
     #[test]
     fn claude_child_metadata_and_demo_protocol() {
