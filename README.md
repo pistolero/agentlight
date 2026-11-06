@@ -186,9 +186,9 @@ This is a first implementation, not full managents parity:
 - Claude Code: live `~/.claude/sessions` registry and process liveness; busy,
   waiting and idle states. Its registry `name` is shown as the activity line;
   the project is derived from the working directory (including worktrees).
-  Running subagents from per-session metadata and recently finished subagents
-  are shown within the parent card. When Claude's task list is available, the
-  card shows completed/total tasks and a progress bar. Shared lists configured
+  Running subagents from per-session metadata and recently finished or stopped
+  subagents are shown within the parent card. When Claude's task list is available,
+  the card shows completed/total tasks and a progress bar. Shared lists configured
   via `CLAUDE_CODE_TASK_LIST_ID` are used when visible in the process environment.
   Registry PID reuse is not currently checked.
   Parked terminal placeholders and idle detached background jobs are excluded;
@@ -200,23 +200,25 @@ This is a first implementation, not full managents parity:
   Direct child sessions with recorded busy/idle times appear as subagents.
   Without tab state, a folder gets one fallback card and no nested children.
 - Codex: live processes, the latest thread for the working directory, and
-  task events in the end of its rollout. Approval prompts are not detected,
+  task events in the end of its rollout. Saved session names (or titles on older
+  versions) are displayed as the activity line. Internal subagent threads are
+  excluded from this selection. Approval prompts are not detected,
   and a stale prior rollout can give a misleading status. Context usage is
   not sent by the helper yet; Codex subagent detection is not implemented.
 
 Agent data formats change; unreadable or unavailable sources fall back to a
 waiting card where possible. The helper reads metadata from local state. By
 default it uses only USB; `--wifi` enables LAN discovery and encrypted remote
-access for explicitly approved devices. Agent IDs, project names, status, timing, Claude
-registry names and OpenCode tab titles go over USB. These activity/title fields
-may contain user-provided or conversation-derived text and are visible on the
-display; subagent names and descriptions are also sent. Full paths are not sent.
+access for explicitly approved devices. Agent IDs, project names, status, timing,
+Claude registry names, OpenCode tab titles and Codex session names/titles go over
+USB. These activity/title fields may contain user-provided or conversation-derived
+text and are visible on the display; subagent names and descriptions are also sent.
+Full paths are not sent.
 **Tapping a session explicitly requests its recent messages, which then go over
 USB and are visible on the screen.** Excerpts can contain sensitive user or
 assistant text; there is no automatic secret redaction. Reasoning blocks and
-tool arguments/results are omitted. Codex has no activity
-line yet. The Codex rollout reader loads up to 256 KiB of a local file in
-memory, but doesn't forward its contents. Environment variables
+tool arguments/results are omitted. The Codex rollout reader loads up to
+256 KiB of a local file in memory, but doesn't forward its contents. Environment variables
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_DATA_HOME` select data directories.
 
 The firmware accepts the subset of the [managents v1 protocol](https://github.com/tonylook/managents/blob/main/docs/protocol.md)

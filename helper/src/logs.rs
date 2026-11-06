@@ -1,5 +1,5 @@
 //! On-demand display excerpts; never include reasoning blocks or tool payloads.
-use crate::{env_path, home, open_db, Claude, State};
+use crate::{codex_thread, env_path, home, open_db, Claude, State};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -187,25 +187,8 @@ fn claude_file(root: &Path, relative: &Path) -> Option<PathBuf> {
 }
 fn codex(pid: u32) -> Option<Vec<Entry>> {
     let cwd = fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
-    let root = env_path("CODEX_HOME", home().join(".codex"));
-    let path = fs::read_dir(root)
-        .ok()?
-        .flatten()
-        .filter_map(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            Some((
-                n.strip_prefix("state_")?
-                    .strip_suffix(".sqlite")?
-                    .parse::<u32>()
-                    .ok()?,
-                e.path(),
-            ))
-        })
-        .max_by_key(|(n, _)| *n)
-        .map(|(_, p)| p)?;
-    let db = open_db(&path)?;
-    let path=db.query_row("SELECT rollout_path FROM threads WHERE cwd=?1 AND archived=0 AND source NOT IN ('exec','mcp') ORDER BY updated_at DESC,created_at DESC LIMIT 1",[cwd.to_string_lossy().as_ref()],|r|r.get::<_,String>(0)).ok()?;
-    transcript(Path::new(&path), false)
+    let thread = codex_thread(cwd.to_string_lossy().as_ref())?;
+    transcript(&thread.rollout_path, false)
 }
 /// Recent conversation entries for an agent, or for one of its subagents.
 pub fn entries(id: &str, child: Option<&str>) -> Option<Vec<Entry>> {

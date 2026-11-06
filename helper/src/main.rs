@@ -366,12 +366,18 @@ struct ClaudeChildMeta {
     #[serde(default)]
     description: String,
     finished: Option<bool>,
+    #[serde(default)]
+    stopped_by_user: bool,
 }
 fn claude_children(session_id: &str) -> Vec<Child> {
+    let root = env_path("CLAUDE_CONFIG_DIR", home().join(".claude"));
+    claude_children_at(session_id, &root, now())
+}
+fn claude_children_at(session_id: &str, root: &Path, at: u64) -> Vec<Child> {
     if session_id.is_empty() || session_id.contains(['/', '\\']) {
         return vec![];
     }
-    let projects = env_path("CLAUDE_CONFIG_DIR", home().join(".claude")).join("projects");
+    let projects = root.join("projects");
     let mut result = Vec::new();
     for project in fs::read_dir(projects).into_iter().flatten().flatten() {
         let directory = project.path().join(session_id).join("subagents");
@@ -386,9 +392,9 @@ fn claude_children(session_id: &str) -> Vec<Child> {
             else {
                 continue;
             };
-            // Claude writes this marker only on completion; absence is normal
-            // for running agents, including worktree-isolated subagents.
-            let finished = meta.finished.unwrap_or(false);
+            // Stopping an agent can set stoppedByUser without setting finished.
+            // Neither marker is required for running worktree-isolated agents.
+            let finished = meta.finished.unwrap_or(false) || meta.stopped_by_user;
             let updated = file
                 .metadata()
                 .ok()
@@ -396,7 +402,7 @@ fn claude_children(session_id: &str) -> Vec<Child> {
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|t| t.as_secs())
                 .unwrap_or(0);
-            let age = now().saturating_sub(updated);
+            let age = at.saturating_sub(updated);
             if finished && age > 120 {
                 continue;
             }
@@ -544,9 +550,16 @@ struct RolloutPayload {
     error: Option<serde::de::IgnoredAny>,
 }
 
-fn codex_status(dir: &str) -> (String, u64) {
-    let codex = env_path("CODEX_HOME", home().join(".codex"));
-    let dbpath = fs::read_dir(codex)
+struct CodexThread {
+    rollout_path: PathBuf,
+    title: Option<String>,
+}
+fn codex_thread(dir: &str) -> Option<CodexThread> {
+    let root = env_path("CODEX_HOME", home().join(".codex"));
+    codex_thread_at(&root, dir)
+}
+fn codex_thread_at(root: &Path, dir: &str) -> Option<CodexThread> {
+    let dbpath = fs::read_dir(root)
         .into_iter()
         .flatten()
         .flatten()
@@ -561,13 +574,23 @@ fn codex_status(dir: &str) -> (String, u64) {
         })
         .max_by_key(|(version, _)| *version)
         .map(|(_, p)| p);
-    let Some(db) = dbpath.as_deref().and_then(open_db) else {
-        return ("waiting".into(), 0);
-    };
-    let query = "SELECT rollout_path FROM threads WHERE cwd=?1 AND archived=0 AND source NOT IN ('exec','mcp') ORDER BY updated_at DESC,created_at DESC LIMIT 1";
-    let Ok(path) = db.query_row(query, [dir], |r| r.get::<_, String>(0)) else {
-        return ("waiting".into(), 0);
-    };
+    let db = dbpath.as_deref().and_then(open_db)?;
+    // Newer Codex databases keep the displayed session name separately from
+    // the initial prompt in title. Internal subagent threads are not cards.
+    let scope = "FROM threads WHERE cwd=?1 AND archived=0 AND source NOT IN ('exec','mcp') AND source NOT LIKE '%\"subagent\"%' ORDER BY updated_at DESC,created_at DESC LIMIT 1";
+    let named = format!("SELECT rollout_path, coalesce(nullif(trim(name),''),title,'') {scope}");
+    let legacy = format!("SELECT rollout_path, coalesce(title,'') {scope}");
+    let mut query = db.prepare(&named).or_else(|_| db.prepare(&legacy)).ok()?;
+    query
+        .query_row([dir], |r| {
+            Ok(CodexThread {
+                rollout_path: PathBuf::from(r.get::<_, String>(0)?),
+                title: activity(&r.get::<_, String>(1)?),
+            })
+        })
+        .ok()
+}
+fn codex_status(path: &Path) -> (String, u64) {
     let Ok(mut file) = fs::File::open(path) else {
         return ("waiting".into(), 0);
     };
@@ -712,16 +735,24 @@ fn process_sessions() -> Vec<Agent> {
                 continue;
             }
         }
+        let codex = if executable == "codex" {
+            codex_thread(&dir)
+        } else {
+            None
+        };
         let (status, age) = if executable == "opencode" {
             opencode_status(&dir, None)
         } else {
-            codex_status(&dir)
+            codex
+                .as_ref()
+                .map(|thread| codex_status(&thread.rollout_path))
+                .unwrap_or_else(|| ("waiting".into(), 0))
         };
         result.push(Agent {
             id: format!("{executable}:{pid}"),
             kind: executable.into(),
             name: name(&dir),
-            activity: None,
+            activity: codex.and_then(|thread| thread.title),
             status,
             age,
             children: vec![],
@@ -1021,6 +1052,56 @@ mod tests {
         assert_eq!(file.cwd["/project"].tabs[1].title, "Second");
     }
     #[test]
+    fn codex_cards_use_saved_names_and_support_legacy_titles() {
+        let root =
+            std::env::temp_dir().join(format!("agentlight-codex-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let legacy = Connection::open(root.join("state_4.sqlite")).unwrap();
+        legacy.execute_batch("CREATE TABLE threads (cwd TEXT, rollout_path TEXT, title TEXT, source TEXT, archived INTEGER, updated_at INTEGER, created_at INTEGER);
+            INSERT INTO threads VALUES ('/project','legacy.jsonl','Legacy title','cli',0,100,100);").unwrap();
+        drop(legacy);
+        assert_eq!(
+            codex_thread_at(&root, "/project").unwrap().title.as_deref(),
+            Some("Legacy title")
+        );
+
+        let db = Connection::open(root.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (cwd TEXT, rollout_path TEXT, title TEXT, name TEXT, source TEXT, archived INTEGER, updated_at INTEGER, created_at INTEGER);
+            INSERT INTO threads VALUES ('/project','current.jsonl','Original prompt','Fix subagent count mismatch','vscode',0,10,10);").unwrap();
+        for (cwd, source, archived) in [
+            ("/other", "cli", 0),
+            ("/project", "cli", 1),
+            ("/project", "exec", 0),
+            ("/project", "mcp", 0),
+            ("/project", r#"{"subagent":{"other":"guardian"}}"#, 0),
+        ] {
+            db.execute("INSERT INTO threads VALUES (?1,'internal.jsonl','Internal title','Internal name',?2,?3,20,20)", rusqlite::params![cwd, source, archived]).unwrap();
+        }
+        let thread = codex_thread_at(&root, "/project").unwrap();
+        assert_eq!(thread.title.as_deref(), Some("Fix subagent count mismatch"));
+        assert_eq!(thread.rollout_path, Path::new("current.jsonl"));
+        for name in [Some(""), Some("   "), None] {
+            db.execute(
+                "UPDATE threads SET name=?1 WHERE rollout_path='current.jsonl'",
+                [name],
+            )
+            .unwrap();
+            assert_eq!(
+                codex_thread_at(&root, "/project").unwrap().title.as_deref(),
+                Some("Original prompt")
+            );
+        }
+        db.execute(
+            "UPDATE threads SET title='  ' WHERE rollout_path='current.jsonl'",
+            [],
+        )
+        .unwrap();
+        assert!(codex_thread_at(&root, "/project").unwrap().title.is_none());
+        assert!(codex_thread_at(&root, "/missing").is_none());
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn claude_child_metadata_and_demo_protocol() {
         let child: ClaudeChildMeta = serde_json::from_str(
             r#"{"agentType":"Explore","description":"Inspect UI","finished":false}"#,
@@ -1050,6 +1131,60 @@ mod tests {
         assert_eq!(child_name("", "Explore"), "Explore");
         assert_eq!(child_name("", ""), "Subagent");
         assert!(child_name(&"é".repeat(40), "Explore").len() <= 40);
+    }
+    #[test]
+    fn stopped_claude_children_expire_even_without_finished_marker() {
+        let root =
+            std::env::temp_dir().join(format!("agentlight-children-test-{}", std::process::id()));
+        let dir = root.join("projects/project/session/subagents");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, body) in [
+            (
+                "agent-running.meta.json",
+                r#"{"description":"Running","spawnedWithWorktree":true}"#,
+            ),
+            (
+                "agent-stopped.meta.json",
+                r#"{"description":"Stopped","stoppedByUser":true}"#,
+            ),
+            (
+                "agent-stopped-false.meta.json",
+                r#"{"description":"Stopped before finish","finished":false,"stoppedByUser":true}"#,
+            ),
+            (
+                "agent-finished.meta.json",
+                r#"{"description":"Finished","finished":true}"#,
+            ),
+        ] {
+            let path = dir.join(name);
+            fs::write(&path, body).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1000)),
+                )
+                .unwrap();
+        }
+        let recent = claude_children_at("session", &root, 1120);
+        assert_eq!(recent.len(), 4);
+        for child in &recent {
+            assert_eq!(child.age, 120);
+            assert_eq!(
+                child.status,
+                if child.name == "Running" {
+                    "working"
+                } else {
+                    "done"
+                }
+            );
+        }
+        let expired = claude_children_at("session", &root, 1121);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].name, "Running");
+        assert_eq!(expired[0].status, "working");
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn idle_detached_jobs_stay_visible_but_parked_shells_do_not() {
