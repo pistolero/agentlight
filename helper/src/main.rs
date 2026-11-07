@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 mod logs;
 mod ota;
+mod usage;
+mod waits;
 mod wifi;
 use clap::Parser;
 use rusqlite::{Connection, OpenFlags};
@@ -62,6 +64,23 @@ struct Agent {
     children: Vec<Child>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tasks: Option<TaskProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ctx: Option<Ctx>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    limits: Vec<PlanLimit>,
+}
+/// Context in use; `limit` is absent when the tool doesn't record a size.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct Ctx {
+    used: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<u64>,
+}
+/// Percent used of an account plan window, labelled like "5h" or "7d".
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct PlanLimit {
+    l: String,
+    p: u8,
 }
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 struct TaskProgress {
@@ -145,6 +164,25 @@ fn child_name(description: &str, kind: &str) -> String {
         .or_else(|| activity(kind))
         .unwrap_or_else(|| "Subagent".into());
     limit_text(&title, 40)
+}
+/// Keep a state frame within the display's 4 KB limit. Usage figures go first,
+/// then subagents, so the limit costs a session its card only as a last resort.
+fn fit_frame(s: &mut State) -> Result<Vec<u8>> {
+    let mut frame = serde_json::to_vec(s).context("encode state")?;
+    while frame.len() > 4096 && !s.agents.is_empty() {
+        if let Some(a) = s.agents.iter_mut().rev().find(|a| !a.limits.is_empty()) {
+            a.limits.clear();
+        } else if let Some(a) = s.agents.iter_mut().rev().find(|a| a.ctx.is_some()) {
+            a.ctx = None;
+        } else if let Some(a) = s.agents.iter_mut().rev().find(|a| !a.children.is_empty()) {
+            a.children.pop();
+        } else {
+            s.agents.pop();
+            s.more += 1;
+        }
+        frame = serde_json::to_vec(s)?;
+    }
+    Ok(frame)
 }
 fn state(mut agents: Vec<Agent>) -> State {
     agents.sort_by(|a, b| (&a.name, &a.kind, &a.id).cmp(&(&b.name, &b.kind, &b.id)));
@@ -296,6 +334,11 @@ fn claude_sessions() -> Vec<Agent> {
             } else {
                 "waiting"
             };
+            let (status, age) = if waiting || r.status == "waiting" {
+                (status.into(), age)
+            } else {
+                claude_waits(&r.session_id).resolve((status, age), now())
+            };
             Agent {
                 id: format!("claude:{pid}"),
                 kind: "claude".into(),
@@ -305,10 +348,30 @@ fn claude_sessions() -> Vec<Agent> {
                 age,
                 children: claude_children(&r.session_id),
                 tasks: claude_tasks(&r.session_id, r.pid),
+                ctx: usage::claude_context(&r.session_id),
+                limits: vec![],
             }
         })
         .collect()
 }
+fn claude_waits(session: &str) -> waits::Evidence {
+    if session.is_empty() || session.contains(['/', '\\']) || session == "." || session == ".." {
+        return waits::Evidence::default();
+    }
+    let root = env_path("CLAUDE_CONFIG_DIR", home().join(".claude"));
+    for project in fs::read_dir(root.join("projects"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = project.path().join(format!("{session}.jsonl"));
+        if let Some((values, _)) = usage::tail_values(&path, 256 * 1024, b"\"message\"") {
+            return waits::claude(&values);
+        }
+    }
+    waits::Evidence::default()
+}
+
 fn claude_tasks(session_id: &str, pid: u32) -> Option<TaskProgress> {
     let env = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
     let override_id = env
@@ -477,11 +540,57 @@ fn opencode_status(dir: &str, session_id: Option<&str>) -> (String, u64) {
             } else {
                 "working"
             };
-            (status.into(), age)
+            if status == "error" {
+                (status.into(), age)
+            } else {
+                opencode_waits(&db, &dir, session_id).resolve((status, age), now())
+            }
         }
         Err(_) => ("waiting".into(), 0),
     }
 }
+fn opencode_waits(db: &Connection, dir: &str, session: Option<&str>) -> waits::Evidence {
+    let mut evidence = waits::Evidence::default();
+    let session = session.map(str::to_owned).or_else(|| {
+        db.query_row("SELECT id FROM session_v2 WHERE directory=?1 AND parent_id IS NULL ORDER BY time_updated DESC LIMIT 1", [dir], |r| r.get::<_,String>(0)).or_else(|_| {
+            db.query_row("SELECT id FROM session WHERE directory=?1 AND parent_id IS NULL ORDER BY time_updated DESC LIMIT 1", [dir], |r| r.get(0))
+        }).ok()
+    });
+    let Some(session) = session else {
+        return evidence;
+    };
+    let modern = "SELECT call_id,data,time_updated FROM session_part WHERE session_id=?1 AND type='tool' AND message_id=(SELECT id FROM session_message WHERE session_id=?1 ORDER BY time_created DESC,seq DESC LIMIT 1) ORDER BY ordinal";
+    let legacy = "SELECT coalesce(json_extract(data,'$.callID'),id),data,time_updated FROM part WHERE session_id=?1 AND json_extract(data,'$.type')='tool' AND message_id=(SELECT id FROM message WHERE session_id=?1 ORDER BY time_created DESC LIMIT 1) ORDER BY time_created";
+    let Ok(mut stmt) = db.prepare(modern).or_else(|_| db.prepare(legacy)) else {
+        return evidence;
+    };
+    let Ok(rows) = stmt.query_map([session], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, u64>(2)?,
+        ))
+    }) else {
+        return evidence;
+    };
+    for (id, data, updated) in rows.flatten() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        if !matches!(v["state"]["status"].as_str(), Some("pending" | "running")) {
+            continue;
+        }
+        let at = v["state"]["time"]["start"].as_u64().unwrap_or(updated) / 1000;
+        evidence.call(
+            &id,
+            v["tool"].as_str().unwrap_or(""),
+            &v["state"]["input"],
+            at,
+        );
+    }
+    evidence
+}
+
 fn opencode_children(session_id: &str) -> Vec<Child> {
     let path = env_path("XDG_DATA_HOME", home().join(".local/share")).join("opencode/opencode.db");
     let Some(db) = open_db(&path) else {
@@ -738,6 +847,110 @@ fn codex_lifecycle(event: RolloutEvent, at: u64) -> Option<(&'static str, u64)> 
         at.saturating_sub(timestamp.timestamp().max(0) as u64),
     ))
 }
+/// The newest tool call of the current turn still waiting for its result.
+fn codex_pending_call(values: &[serde_json::Value]) -> Option<(String, u64)> {
+    let mut calls: Vec<(String, String, u64)> = vec![];
+    for v in values {
+        let p = &v["payload"];
+        match p["type"].as_str().unwrap_or("") {
+            // A new turn: anything unanswered before it was abandoned.
+            "task_started" | "task_complete" | "turn_aborted" => calls.clear(),
+            "function_call" | "custom_tool_call" => {
+                let at = chrono::DateTime::parse_from_rfc3339(v["timestamp"].as_str()?)
+                    .ok()?
+                    .timestamp()
+                    .max(0) as u64;
+                calls.push((
+                    p["call_id"].as_str()?.to_string(),
+                    p["name"].as_str().unwrap_or("").to_string(),
+                    at,
+                ));
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                calls.retain(|(id, ..)| Some(id.as_str()) != p["call_id"].as_str());
+            }
+            _ => (),
+        }
+    }
+    calls.pop().map(|(_, name, at)| (name, at))
+}
+/// Whether a turn in progress is really stopped on the user. Codex records no
+/// "waiting for approval" event, so this infers it: a command-type call with no
+/// result, no process started for it, and no subworker it could be waiting on.
+fn codex_stopped_on_user(
+    pending: Option<&(String, u64)>,
+    at: u64,
+    command_running: impl Fn(u64) -> bool,
+    subworkers_active: bool,
+) -> Option<u64> {
+    let (name, since) = pending?;
+    let age = at.saturating_sub(*since);
+    if name == "request_user_input" || name == "request_permissions" {
+        return Some(age);
+    }
+    let approvable = matches!(
+        name.as_str(),
+        "exec" | "exec_command" | "shell" | "shell_command" | "local_shell" | "apply_patch"
+    );
+    (approvable && age >= 30 && !subworkers_active && !command_running(*since)).then_some(age)
+}
+/// Whether a process descending from any Codex process started at or after
+/// `since`. Older ones (MCP servers, say) can't be running this tool call.
+fn codex_process_started_since(since: u64) -> bool {
+    let boot = fs::read_to_string("/proc/stat")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    // pid -> (parent, started at, is codex)
+    let mut procs = std::collections::HashMap::new();
+    for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // The command name may contain spaces, so split after its closing ")".
+        let Some((head, rest)) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let (Some(parent), Some(start)) = (
+            fields.get(1).and_then(|f| f.parse::<u32>().ok()),
+            fields.get(19).and_then(|f| f.parse::<u64>().ok()),
+        ) else {
+            continue;
+        };
+        procs.insert(
+            pid,
+            (parent, boot + start / ticks, head.ends_with("(codex")),
+        );
+    }
+    procs.iter().any(|(pid, (_, started, is_codex))| {
+        if *is_codex || *started < since {
+            return false;
+        }
+        let mut current = *pid;
+        for _ in 0..64 {
+            let Some((parent, _, codex)) = procs.get(&current) else {
+                return false;
+            };
+            if *codex {
+                return true;
+            }
+            current = *parent;
+        }
+        false
+    })
+}
 fn codex_status(path: &Path) -> (String, u64) {
     let (status, age) = codex_rollout_status(path, now()).unwrap_or(("waiting", 0));
     let status = if status != "working" && age >= 7200 {
@@ -792,6 +1005,7 @@ fn opencode_tabs(dir: &str) -> Vec<OpenTab> {
 
 fn process_sessions() -> Vec<Agent> {
     let mut result = Vec::new();
+    let mut codex_plan = usage::CodexUsage::default();
     let mut seen = HashSet::new();
     let entries = match fs::read_dir("/proc") {
         Ok(e) => e,
@@ -851,6 +1065,8 @@ fn process_sessions() -> Vec<Agent> {
                         age,
                         children: opencode_children(&tab.session_id),
                         tasks: None,
+                        ctx: usage::opencode_context(&tab.session_id),
+                        limits: vec![],
                     });
                 }
                 continue;
@@ -861,45 +1077,85 @@ fn process_sessions() -> Vec<Agent> {
         } else {
             None
         };
+        let children = codex
+            .as_ref()
+            .map(|thread| codex_children(&thread.id))
+            .unwrap_or_default();
         let (status, age) = if executable == "opencode" {
             opencode_status(&dir, None)
         } else {
-            codex
+            let (status, age) = codex
                 .as_ref()
                 .map(|thread| codex_status(&thread.rollout_path))
-                .unwrap_or_else(|| ("waiting".into(), 0))
+                .unwrap_or_else(|| ("waiting".into(), 0));
+            let stopped = codex
+                .as_ref()
+                .filter(|_| status == "working")
+                .and_then(|thread| {
+                    let (values, _) =
+                        usage::tail_values(&thread.rollout_path, 256 * 1024, b"\"payload\"")?;
+                    codex_stopped_on_user(
+                        codex_pending_call(&values).as_ref(),
+                        now(),
+                        codex_process_started_since,
+                        false,
+                    )
+                });
+            let base = match stopped {
+                Some(waited) => ("waiting".into(), waited),
+                None => (status, age),
+            };
+            codex
+                .as_ref()
+                .and_then(|thread| {
+                    usage::tail_values(&thread.rollout_path, 256 * 1024, b"\"payload\"")
+                })
+                .map(|(values, _)| waits::codex(&values).resolve((&base.0, base.1), now()))
+                .unwrap_or(base)
         };
+        let codex_usage = codex
+            .as_ref()
+            .and_then(|thread| usage::codex_usage(&thread.rollout_path))
+            .unwrap_or_default();
+        if codex_usage.at > codex_plan.at {
+            codex_plan = codex_usage.clone();
+        }
         result.push(Agent {
             id: format!("{executable}:{pid}"),
             kind: executable.into(),
             name: name(&dir),
-            children: codex
-                .as_ref()
-                .map(|thread| codex_children(&thread.id))
-                .unwrap_or_default(),
+            children,
             activity: codex.and_then(|thread| thread.title),
             status,
             age,
             tasks: None,
+            ctx: codex_usage.ctx,
+            limits: vec![],
         });
+    }
+    // Plan limits belong to the account, so the newest reading applies to all.
+    let windows = usage::current_windows(&codex_plan, now());
+    for agent in result.iter_mut().filter(|a| a.kind == "codex") {
+        agent.limits = windows.clone();
     }
     result
 }
 fn collect(demo: bool) -> Vec<Agent> {
     if demo {
-        return ["working", "waiting", "error", "idle"]
+        return ["working", "waiting", "error", "idle", "waiting_task"]
             .into_iter()
             .enumerate()
             .map(|(i, s)| Agent {
                 id: format!("demo:{i}"),
-                kind: ["claude", "opencode", "codex", "opencode"][i].into(),
-                name: ["api-server", "dashboard", "firmware", "docs"][i].into(),
+                kind: ["claude", "opencode", "codex", "opencode", "claude"][i].into(),
+                name: ["api-server", "dashboard", "firmware", "docs", "tests"][i].into(),
                 activity: activity(
                     [
                         "Implementing status cards",
                         "Reviewing layout",
                         "Fixing USB",
                         "Updating documentation",
+                        "Waiting for test results",
                     ][i],
                 ),
                 status: s.into(),
@@ -922,6 +1178,24 @@ fn collect(demo: bool) -> Vec<Agent> {
                     })
                 } else {
                     None
+                },
+                ctx: Some(Ctx {
+                    used: [640_000, 418_000, 390_000, 12_000, 20_000][i],
+                    limit: [Some(1_000_000), None, Some(475_000), None, None][i],
+                }),
+                limits: if i == 2 {
+                    vec![
+                        PlanLimit {
+                            l: "5h".into(),
+                            p: 42,
+                        },
+                        PlanLimit {
+                            l: "7d".into(),
+                            p: 96,
+                        },
+                    ]
+                } else {
+                    vec![]
                 },
             })
             .collect();
@@ -1012,17 +1286,7 @@ fn main() -> Result<()> {
             eprintln!("Connected to {path}");
             loop {
                 let mut s = state(collect(args.demo));
-                let mut frame = serde_json::to_vec(&s).context("encode state")?;
-                while frame.len() > 4096 && !s.agents.is_empty() {
-                    if let Some(agent) = s.agents.iter_mut().rev().find(|a| !a.children.is_empty())
-                    {
-                        agent.children.pop();
-                    } else {
-                        s.agents.pop();
-                        s.more += 1;
-                    }
-                    frame = serde_json::to_vec(&s)?;
-                }
+                let mut frame = fit_frame(&mut s)?;
                 frame.push(b'\n');
                 if port.write_all(&frame).is_err() {
                     eprintln!("Disconnected from {path}");
@@ -1098,9 +1362,162 @@ mod tests {
     #[test]
     fn demo_is_valid_and_bounded() {
         let s = state(collect(true));
-        let v = serde_json::to_value(s).unwrap();
+        let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["v"], 1);
-        assert_eq!(v["agents"].as_array().unwrap().len(), 4);
+        assert_eq!(v["agents"].as_array().unwrap().len(), 5);
+        assert!(s.agents.iter().any(|a| a.status == "waiting_task"));
+    }
+    #[test]
+    fn opencode_waits_use_current_message_and_running_parts_in_both_schemas() {
+        for modern in [true, false] {
+            let db = Connection::open_in_memory().unwrap();
+            if modern {
+                db.execute_batch("CREATE TABLE session_message (id TEXT,session_id TEXT,time_created INTEGER,seq INTEGER); CREATE TABLE session_part (message_id TEXT,session_id TEXT,ordinal INTEGER,type TEXT,call_id TEXT,data TEXT,time_updated INTEGER); INSERT INTO session_message VALUES ('m','s',100000,1);").unwrap();
+            } else {
+                db.execute_batch("CREATE TABLE message (id TEXT,session_id TEXT,time_created INTEGER); CREATE TABLE part (id TEXT,message_id TEXT,session_id TEXT,data TEXT,time_created INTEGER,time_updated INTEGER); INSERT INTO message VALUES ('m','s',100000);").unwrap();
+            }
+            let part=serde_json::json!({"type":"tool","callID":"call","tool":"task","state":{"status":"running","time":{"start":100000},"input":{"subagent_type":"explore"}}}).to_string();
+            if modern {
+                db.execute(
+                    "INSERT INTO session_part VALUES ('m','s',0,'tool','call',?1,100000)",
+                    [&part],
+                )
+                .unwrap();
+            } else {
+                db.execute(
+                    "INSERT INTO part VALUES ('p','m','s',?1,100000,100000)",
+                    [&part],
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                opencode_waits(&db, "", Some("s")).resolve(("working", 0), 150),
+                ("waiting_task".into(), 50)
+            );
+            assert_eq!(
+                opencode_waits(&db, "", Some("other"))
+                    .resolve(("working", 0), 150)
+                    .0,
+                "working"
+            );
+            let table = if modern { "session_part" } else { "part" };
+            db.execute(
+                &format!("UPDATE {table} SET data=json_set(data,'$.state.status','completed')"),
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                opencode_waits(&db, "", Some("s"))
+                    .resolve(("working", 0), 150)
+                    .0,
+                "working"
+            );
+            db.execute(
+                &format!("UPDATE {table} SET data=json_set(data,'$.state.status','running')"),
+                [],
+            )
+            .unwrap();
+            if modern {
+                db.execute_batch("INSERT INTO session_message VALUES ('new','s',110000,2);")
+                    .unwrap();
+            } else {
+                db.execute_batch("INSERT INTO message VALUES ('new','s',110000);")
+                    .unwrap();
+            }
+            assert_eq!(
+                opencode_waits(&db, "", Some("s"))
+                    .resolve(("working", 0), 150)
+                    .0,
+                "working"
+            );
+        }
+    }
+    #[test]
+    fn codex_finds_the_unanswered_call_of_the_current_turn() {
+        let t = "2026-11-06T14:02:57Z";
+        let call = |id: &str, name: &str| serde_json::json!({"timestamp":t,"payload":{"type":"custom_tool_call","call_id":id,"name":name}});
+        let output = |id: &str| serde_json::json!({"timestamp":t,"payload":{"type":"custom_tool_call_output","call_id":id}});
+        let event = |kind: &str| serde_json::json!({"timestamp":t,"payload":{"type":kind}});
+        assert_eq!(codex_pending_call(&[call("a", "exec"), output("a")]), None);
+        let pending = codex_pending_call(&[call("a", "exec"), output("a"), call("b", "exec")]);
+        assert_eq!(pending.unwrap().0, "exec");
+        // A call left unanswered by an earlier, finished turn doesn't count.
+        assert_eq!(
+            codex_pending_call(&[
+                call("a", "exec"),
+                event("task_complete"),
+                event("task_started")
+            ]),
+            None
+        );
+    }
+    #[test]
+    fn codex_is_stopped_on_user_only_when_nothing_explains_the_wait() {
+        let exec = ("exec".to_string(), 1000);
+        let idle = |_: u64| false;
+        let running = |_: u64| true;
+        assert_eq!(
+            codex_stopped_on_user(Some(&exec), 1040, idle, false),
+            Some(40)
+        );
+        // Too soon to tell.
+        assert_eq!(codex_stopped_on_user(Some(&exec), 1010, idle, false), None);
+        // A long-running command or an active subworker explains the wait.
+        assert_eq!(
+            codex_stopped_on_user(Some(&exec), 1040, running, false),
+            None
+        );
+        assert_eq!(codex_stopped_on_user(Some(&exec), 1040, idle, true), None);
+        // Waiting on other tools isn't waiting on the user.
+        let wait = ("wait_agent".to_string(), 1000);
+        assert_eq!(codex_stopped_on_user(Some(&wait), 5000, idle, false), None);
+        // Asking the user is certain, whatever else is happening.
+        let ask = ("request_user_input".to_string(), 1000);
+        assert_eq!(
+            codex_stopped_on_user(Some(&ask), 1001, running, true),
+            Some(1)
+        );
+        assert_eq!(codex_stopped_on_user(None, 5000, idle, false), None);
+    }
+    #[test]
+    fn frames_drop_usage_before_sessions() {
+        let agent = |i: usize| Agent {
+            id: format!("claude:{i}"),
+            kind: "claude".into(),
+            name: "x".repeat(40),
+            activity: Some("y".repeat(40)),
+            status: "working".into(),
+            age: 1,
+            children: vec![],
+            tasks: None,
+            ctx: Some(Ctx {
+                used: 123_456,
+                limit: Some(1_000_000),
+            }),
+            limits: vec![
+                PlanLimit {
+                    l: "5h".into(),
+                    p: 1,
+                },
+                PlanLimit {
+                    l: "7d".into(),
+                    p: 2,
+                },
+            ],
+        };
+        let mut s = state((0..24).map(agent).collect());
+        let frame = fit_frame(&mut s).unwrap();
+        assert!(frame.len() <= 4096);
+        assert_eq!(
+            s.agents.len(),
+            24,
+            "usage figures must go before any session"
+        );
+        assert_eq!(s.more, 0);
+        // Everything that fits is left alone.
+        let mut small = state(vec![agent(0)]);
+        fit_frame(&mut small).unwrap();
+        assert!(small.agents[0].ctx.is_some() && !small.agents[0].limits.is_empty());
     }
     #[test]
     fn cap_and_order() {
@@ -1113,6 +1530,8 @@ mod tests {
             age: 0,
             children: vec![],
             tasks: None,
+            ctx: None,
+            limits: vec![],
         };
         let s = state(vec![a; 30]);
         assert_eq!(s.more, 6);
@@ -1129,6 +1548,8 @@ mod tests {
             age,
             children: vec![],
             tasks: None,
+            ctx: None,
+            limits: vec![],
         };
         let first = state(vec![
             make("b", "beta", "working", 1),

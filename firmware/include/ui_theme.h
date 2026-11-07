@@ -26,8 +26,8 @@ struct StatusStyle { uint16_t color, tint, pill; const char *label; };
 // Card tint: the status color at ~18% over the surface; pill a bit stronger.
 inline StatusStyle statusStyle(const String &status) {
   using namespace Theme;
-  uint16_t c = status == "working" ? WORKING : status == "waiting" ? WAITING : status == "error" ? ERROR_ : status == "done" ? DONE : IDLE;
-  const char *label = status == "working" ? "WORKING" : status == "waiting" ? "NEEDS YOU" : status == "error" ? "ERROR" : status == "done" ? "DONE" : "IDLE";
+  uint16_t c = status == "waiting_task" ? DONE : status == "working" ? WORKING : status == "waiting" ? WAITING : status == "error" ? ERROR_ : status == "done" ? DONE : IDLE;
+  const char *label = status == "waiting_task" ? "WAITING TASK" : status == "working" ? "WORKING" : status == "waiting" ? "NEEDS YOU" : status == "error" ? "ERROR" : status == "done" ? "DONE" : "IDLE";
   uint8_t tint = status == "idle" ? 22 : 46;
   return {c, mix(SURFACE, c, tint), mix(SURFACE, c, 90), label};
 }

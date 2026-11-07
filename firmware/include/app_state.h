@@ -5,15 +5,18 @@
 #include "power_mode.h"
 
 // Data model shared by the protocol parser, input handling and screens.
-constexpr int MAX_AGENTS = 24, PAGE_SIZE = 9, MAX_CHILDREN = 6;
+constexpr int MAX_AGENTS = 24, PAGE_SIZE = 9, MAX_CHILDREN = 6, MAX_LIMITS = 2;
 constexpr uint32_t STALE_MS = 6000;
 
 struct Child { String id, name, status, activity; uint32_t age; };
+struct PlanLimit { String label; uint8_t percent; };
 struct Agent {
   String id, kind, name, activity, status;
   uint32_t age, used, limit, tasksDone, tasksTotal;
   Child children[MAX_CHILDREN];
   int childCount;
+  PlanLimit limits[MAX_LIMITS];
+  int limitCount;
 };
 
 inline Canvas canvas;

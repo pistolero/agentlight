@@ -53,6 +53,27 @@ page after 30 seconds. Until the first update arrives, and again after six
 seconds without one, a connection screen lists what the display is waiting for
 (Wi-Fi, helper) and how to fix it.
 
+## Usage figures
+
+Each card shows usage as small text beside the project name; on small cards the
+name shortens to make room. Figures are muted normally, amber at 80% and red at
+95%.
+
+| Tool | Context | Plan limits |
+|---|---|---|
+| Claude Code | `ctx 52%` | Not shown |
+| Codex | `ctx 27%` | `5h 42%`, `7d 1%` |
+| OpenCode | `ctx 490k` (tokens) | Not shown |
+
+- `ctx` is how full that session's context was at its last response. OpenCode
+  doesn't record a context size locally, so it shows tokens instead of a percent.
+  So does a Claude model missing from Claude Code's local model catalog.
+- Codex plan limits apply to the account, so all Codex cards show the newest
+  reading. A window past its reset time is hidden rather than shown out of date.
+- Claude Code gives its plan limits only to a status line script, and the helper
+  doesn't install one, so they aren't shown.
+- All figures come from local files; the helper makes no extra network requests.
+
 ## Sleep mode
 
 Tap the moon in the top bar to save power, for example on a powerbank. The
@@ -251,6 +272,24 @@ subworker logs. Unavailable sources show an explanation. Nothing is read for a l
 requested, and device requests must identify a currently sent session or
 subagent.
 
+## Display driver workaround
+
+The firmware works around an ESP-IDF RGB driver problem. With
+`CONFIG_LCD_RGB_RESTART_IN_VSYNC`, which the precompiled Arduino libraries set,
+the driver restarts output from bounce buffer 0 each frame but never resets
+`bb_eof_count`, the count that picks which buffer to refill. One lost interrupt
+leaves it odd until the next restart, and the picture stays shifted with stale
+slices at the left of the screen.
+
+`firmware/src/main.cpp` zeroes the count at every VSYNC, as the driver's other
+configuration does. The field is private, so `locateEofCount()` finds it in memory
+at startup and turns the workaround off if the check fails. **A platform update
+can change this:** if steady tearing returns after one, check the workaround first.
+
+Clock speed doesn't affect this problem, but it does affect Wi-Fi: encrypted logins
+fail at 21 MHz, so the display drops to 14 MHz while connecting or updating. The
+screen goes dark during flash writes because they stall the panel badly regardless.
+
 ## Hardware validation
 
 The firmware builds against the 5B board configuration from
@@ -260,3 +299,21 @@ copying into the active scanout buffer. RGB runs at a conservative 14 MHz with
 20-line internal bounce buffers to leave bandwidth for Wi-Fi. Before relying on
 it, test on the actual board: colors, touch, USB reconnection, longer operation
 and RGB drift/tearing. Build success alone does not verify these behaviors.
+
+### Waiting for tasks versus user input
+
+WAITING TASK (blue) means a recorded blocking call is waiting for its referenced
+command, task or worker. NEEDS YOU (amber) remains the status for user input;
+an explicit question takes priority even when other work continues. Task waits
+do not wake the screen or hold a Sleep-mode attention alert.
+
+Claude tool calls/results, Codex call IDs/arguments/results, and OpenCode tool
+parts supply the dependency evidence. Completed calls, interrupted turns and new
+turns clear it. Nonblocking polls and unattended background launches such as the
+Agentlight helper do not count. In-flight counts or active workers alone are not
+proof of a dependency: when evidence is absent or unsupported, the normal
+provider status remains. Excerpts used for detection stay local.
+
+The new `waiting_task` parent status requires firmware 0.5.10 or later. Upgrade
+the display with the previous helper before starting a helper that emits it;
+older firmware rejects frames containing unknown parent statuses.

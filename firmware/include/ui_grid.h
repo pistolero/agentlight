@@ -6,16 +6,41 @@ namespace GridScreen {
 constexpr int BAR = 56;
 inline String clockText();
 
+// One figure in a card's usage text, like "ctx 64%" or "7d 1%".
+struct UsagePart { String text; uint16_t color; };
+inline uint16_t usageColor(uint32_t percent) {
+  return percent >= 95 ? Theme::ERROR_ : percent >= 80 ? Theme::WAITING : Theme::TEXT2;
+}
+// Two significant figures, so a repaint isn't forced by every small change.
+inline String tokensText(uint32_t n) {
+  char t[12];
+  if (n >= 995000) snprintf(t, sizeof(t), "%.1fM", n / 1e6f);
+  else if (n >= 100000) snprintf(t, sizeof(t), "%uk", unsigned((n + 5000) / 10000 * 10));
+  else if (n >= 1000) snprintf(t, sizeof(t), "%uk", unsigned((n + 500) / 1000));
+  else snprintf(t, sizeof(t), "%u", unsigned(n));
+  return t;
+}
+inline std::vector<UsagePart> usageParts(const Agent &a) {
+  std::vector<UsagePart> parts;
+  if (a.limit) {
+    uint32_t percent = uint64_t(a.used) * 100 / a.limit;
+    parts.push_back({"ctx " + String(percent) + "%", usageColor(percent)});
+  } else if (a.used) parts.push_back({"ctx " + tokensText(a.used), Theme::TEXT2});
+  for (int i = 0; i < a.limitCount; i++)
+    parts.push_back({a.limits[i].label + " " + String(a.limits[i].percent) + "%", usageColor(a.limits[i].percent)});
+  return parts;
+}
+
 inline void topBar() {
   using namespace Theme;
   canvas.logo(36, BAR / 2, 8);
   canvas.text(58, (BAR - font_s20.height) / 2, "agentlight", font_s20, TEXT);
 
   // Status summary, centered: one colored dot + count per status present.
-  const char *keys[] = {"waiting", "error", "working", "idle"};
-  const char *names[] = {"need you", "error", "working", "idle"};
-  String labels[4]; uint16_t colors[4]; int n = 0, total = 0;
-  for (int k = 0; k < 4; k++) {
+  const char *keys[] = {"waiting", "error", "working", "waiting_task", "idle"};
+  const char *names[] = {"need you", "error", "working", "waiting task", "idle"};
+  String labels[5]; uint16_t colors[5]; int n = 0, total = 0;
+  for (int k = 0; k < 5; k++) {
     int count = 0;
     for (int i = 0; i < agentCount; i++) if (agents[i].status == keys[k]) count++;
     if (!count) continue;
@@ -70,9 +95,9 @@ inline void card(int index, int x, int y, int w, int h) {
   canvas.textRight(x + w - pad, cy + (28 - font_s16.height) / 2, duration(elapsed(a.age)), font_s16, TEXT2);
   cy += 28 + (compact ? 8 : 14);
 
-  // Footer, measured bottom-up: subagent pills, then context and task bars.
+  // Footer, measured bottom-up: subagent pills, then the task bar.
   int bottom = y + h - pad;
-  int footer = (a.childCount ? 40 : 0) + (a.tasksTotal ? 24 : 0) + (a.limit ? 24 : 0);
+  int footer = (a.childCount ? 40 : 0) + (a.tasksTotal ? 24 : 0);
   int subtitle = font_s16.height + 4;
   int room = bottom - footer - subtitle - cy;
 
@@ -87,7 +112,17 @@ inline void card(int index, int x, int y, int w, int h) {
     if (int(lines.size()) * fonts[i]->height <= room && !cut) break;
   }
   for (auto &line : lines) { canvas.text(ix, cy, line, *font, TEXT); cy += font->height; }
-  dotted(ix, cy + 2, a.activity.length() ? canvas.fit(a.name, font_s16, iw / 2) : "", kindLabel(a.kind), font_s16, TEXT2);
+  // Subtitle row: usage figures on the right; the project name gives way to them.
+  int usageX = ix + iw;
+  std::vector<UsagePart> usage = usageParts(a);
+  for (int i = int(usage.size()) - 1; i >= 0; i--) {
+    usageX -= canvas.textWidth(usage[i].text, font_s16);
+    canvas.text(usageX, cy + 2, usage[i].text, font_s16, usage[i].color);
+    usageX -= 12;
+  }
+  String kind = kindLabel(a.kind);
+  int nameRoom = usageX - 8 - ix - canvas.textWidth(kind, font_s16) - 18;
+  dotted(ix, cy + 2, a.activity.length() && nameRoom >= 40 ? canvas.fit(a.name, font_s16, nameRoom) : "", kind, font_s16, TEXT2);
 
   int fy = bottom;
   if (a.childCount) {
@@ -118,10 +153,6 @@ inline void card(int index, int x, int y, int w, int h) {
     canvas.text(ix, fy, label, font_s16, TEXT2);
     canvas.progress(ix + lw + 12, fy + 7, iw - lw - 12, 6, frac, color, track);
   };
-  if (a.limit) {
-    float frac = float(min(a.used, a.limit)) / a.limit;
-    bar("Context " + String(int(frac * 100 + 0.5f)) + "%", frac, frac > 0.85f ? WAITING : TEXT2);
-  }
   if (a.tasksTotal) bar(String(a.tasksDone) + "/" + String(a.tasksTotal) + " tasks", float(a.tasksDone) / a.tasksTotal, st.color);
 }
 
@@ -144,7 +175,7 @@ inline uint32_t key() {
   for (int i = page * PAGE_SIZE; i < min(agentCount, (page + 1) * PAGE_SIZE); i++) {
     const Agent &a = agents[i];
     k.add(a.status); k.add(a.activity); k.add(a.name); k.add(a.kind); k.add(duration(elapsed(a.age)));
-    k.add(a.tasksDone); k.add(a.tasksTotal); k.add(a.limit ? a.used * 100 / a.limit : 0);
+    k.add(a.tasksDone); k.add(a.tasksTotal); for (const UsagePart &part : usageParts(a)) k.add(part.text);
     for (int j = 0; j < a.childCount; j++) { k.add(a.children[j].name); k.add(a.children[j].status); }
   }
   for (int i = 0; i < agentCount; i++) k.add(agents[i].status);  // top bar counts

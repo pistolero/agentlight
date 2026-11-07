@@ -17,11 +17,43 @@ Board board;
 uint16_t *panelBuffers[2] = {nullptr, nullptr};
 int drawBuffer = 1, swapWait = 0;
 DRAM_ATTR SemaphoreHandle_t frameReady = nullptr;
-IRAM_ATTR bool frameFinished(void *data) {
+IRAM_ATTR bool frameFinished(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *) {
   BaseType_t wake = pdFALSE;
-  auto semaphore = *static_cast<SemaphoreHandle_t *>(data);
-  xSemaphoreGiveFromISR(semaphore, &wake);
+  xSemaphoreGiveFromISR(frameReady, &wake);
   return wake == pdTRUE;
+}
+
+// Workaround for a driver problem. With CONFIG_LCD_RGB_RESTART_IN_VSYNC (fixed in
+// this precompiled Arduino build) the RGB driver restarts output from bounce
+// buffer 0 every frame but never resets the count that picks which buffer to
+// refill. One lost interrupt leaves it odd for good: the driver then overwrites
+// the buffer being sent, shifting the picture and leaving stale slices until the
+// next restart. The driver's other configuration zeroes this count each VSYNC,
+// so do the same here. The field is private, so setup() locates it first.
+DRAM_ATTR volatile size_t *eofCount = nullptr;
+IRAM_ATTR bool frameStart(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *) {
+  if (eofCount) *eofCount = 0;
+  return false;
+}
+// Find bb_eof_count in the driver's private panel struct. Its neighbours are a
+// bounce position (a multiple of the 20-line buffer, within the frame) and the
+// expected count of 30, after the timings holding 1024 x 600. Anything other
+// than exactly one match, or a count that isn't moving, disables the workaround.
+void locateEofCount(esp_lcd_panel_handle_t panel, int bouncePixels) {
+  constexpr int WORDS = 256;
+  auto words = reinterpret_cast<volatile uint32_t *>(panel);
+  const uint32_t expected = (WIDTH * HEIGHT) / bouncePixels;
+  int timings = -1, found = -1, matches = 0;
+  for (int i = 0; i + 1 < WORDS; i++) if (words[i] == WIDTH && words[i + 1] == HEIGHT) { timings = i; break; }
+  if (timings < 0) return;
+  for (int i = timings + 2; i < WORDS - 1 && i < timings + 32; i++) {
+    uint32_t position = words[i - 1];
+    if (words[i + 1] == expected && position % bouncePixels == 0 && position <= uint32_t(WIDTH * HEIGHT)) { found = i; matches++; }
+  }
+  if (matches != 1) return;
+  uint32_t before = words[found];
+  delay(100);  // several frames: a live counter must have changed
+  if (words[found] != before) eofCount = reinterpret_cast<volatile size_t *>(&words[found]);
 }
 bool finishBufferSwap() {
   // Two boundaries also cover RGB's PSRAM-to-bounce-buffer pipeline. Never
@@ -33,12 +65,10 @@ bool finishBufferSwap() {
   drawBuffer = 1 - drawBuffer; canvas.pixels = panelBuffers[drawBuffer]; return true;
 }
 
-// Pixel clock: refresh = PCLK / (1368 x 637 clocks per frame). The panel and
-// network share PSRAM bandwidth: 14 MHz (~16 Hz) is safe for the Wi-Fi TLS
-// handshake and OTA downloads but visibly shimmers; 21 MHz (~24 Hz) looks
-// steady. 18 MHz builds failed to log in over Wi-Fi at least intermittently
-// (0.4.2 twice; 0.5.2 once, then it connected), reason unknown. Run fast, and
-// slow down only while heavy network work is in flight.
+// Pixel clock: refresh = PCLK / (1368 x 637 clocks per frame). 21 MHz is about
+// 24 Hz, which doesn't visibly shimmer, but encrypted logins fail at that speed
+// (8 forced reconnects: 9 failed attempts at 21 MHz, none at 14 MHz). So slow down
+// while connecting or updating, and while the screen is dark.
 constexpr uint32_t PCLK_SAFE = 14000000, PCLK_FAST = 21000000;
 constexpr uint32_t PCLK_SLEEP = 8000000;  // nobody can see the scan with the backlight off
 uint32_t pclk = PCLK_SAFE, lastHeavy = 0;
@@ -133,7 +163,7 @@ bool parseState(JsonObjectConst root) {
   for (JsonObjectConst a : list) {
     if (!a["id"].is<const char *>() || !a["kind"].is<const char *>() || !a["name"].is<const char *>() || !a["status"].is<const char *>() || !a["age"].is<uint32_t>()) return false;
     Agent &v = next[n++]; v.id = a["id"].as<String>(); v.kind = a["kind"].as<String>(); v.name = a["name"].as<String>(); v.activity = a["activity"] | ""; v.status = a["status"].as<String>(); v.age = a["age"].as<uint32_t>();
-    if (v.id.isEmpty() || v.id.length() > 48 || v.name.length() > 64 || (v.status != "working" && v.status != "waiting" && v.status != "error" && v.status != "idle")) return false;
+    if (v.id.isEmpty() || v.id.length() > 48 || v.name.length() > 64 || (v.status != "working" && v.status != "waiting_task" && v.status != "waiting" && v.status != "error" && v.status != "idle")) return false;
     v.tasksDone = 0; v.tasksTotal = 0;
     if (a["tasks"].is<JsonObjectConst>()) {
       JsonObjectConst tasks = a["tasks"].as<JsonObjectConst>();
@@ -153,6 +183,12 @@ bool parseState(JsonObjectConst root) {
         if (c.id.isEmpty() || c.id.length() > 48 || c.name.length() > 40 || c.activity.length() > 96 || (c.status != "working" && c.status != "waiting" && c.status != "error" && c.status != "done")) return false;
       }
     } else if (!a["children"].isNull()) return false;
+    // Plan limits are decoration: skip anything malformed, keep the frame.
+    v.limitCount = 0;
+    for (JsonVariantConst item : a["limits"].as<JsonArrayConst>()) {
+      if (v.limitCount >= MAX_LIMITS || !item["l"].is<const char *>() || !item["p"].is<uint8_t>() || item["p"].as<uint8_t>() > 100 || strlen(item["l"].as<const char *>()) > 4) continue;
+      v.limits[v.limitCount++] = {item["l"].as<String>(), item["p"].as<uint8_t>()};
+    }
     v.used = 0; v.limit = 0;
     if (a["ctx"].is<JsonObjectConst>()) {
       auto ctx = a["ctx"].as<JsonObjectConst>();
@@ -311,7 +347,6 @@ void setup() {
   // A complete protocol frame can be 4096 bytes; the HWCDC default is only 256.
   Serial.setRxBufferSize(8192);
   if (!board.init()) { while (true) delay(1000); }
-  // Start at the safe pixel clock; updatePixelClock() raises it once idle.
   // Larger internal bounce buffers keep the scan steady under network load.
   auto rgb = static_cast<BusRGB *>(board.getLCD()->getBus());
   if (!rgb->configRGB_FreqHz(PCLK_SAFE) || !rgb->configRGB_BounceBufferSize(WIDTH * 20) || !rgb->configRGB_FrameBufferNumber(2) || !board.begin()) {
@@ -320,9 +355,15 @@ void setup() {
   panelBuffers[0] = static_cast<uint16_t *>(board.getLCD()->getFrameBufferByIndex(0));
   panelBuffers[1] = static_cast<uint16_t *>(board.getLCD()->getFrameBufferByIndex(1));
   frameReady = xSemaphoreCreateBinary();
-  if (!panelBuffers[0] || !panelBuffers[1] || !frameReady || !board.getLCD()->attachRefreshFinishCallback(frameFinished, &frameReady)) {
+  // Replaces the library's refresh callback, which offers no VSYNC hook.
+  auto panel = board.getLCD()->getRefreshPanelHandle();
+  esp_lcd_rgb_panel_event_callbacks_t callbacks = {};
+  callbacks.on_vsync = frameStart;
+  callbacks.on_frame_buf_complete = frameFinished;
+  if (!panelBuffers[0] || !panelBuffers[1] || !frameReady || esp_lcd_rgb_panel_register_event_callbacks(panel, &callbacks, nullptr) != ESP_OK) {
     Serial.println("RGB double buffering failed"); while (true) delay(1000);
   }
+  locateEofCount(panel, WIDTH * 20);
   canvas.pixels = panelBuffers[drawBuffer];
   if (board.getBacklight()) board.getBacklight()->on();
   WifiLink::begin();

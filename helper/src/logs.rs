@@ -178,7 +178,7 @@ fn claude_session(pid: u32) -> Option<(PathBuf, String)> {
         .and_then(|b| serde_json::from_slice::<Claude>(&b).ok())?;
     safe(&record.session_id).then_some((root, record.session_id))
 }
-fn claude_file(root: &Path, relative: &Path) -> Option<PathBuf> {
+pub(crate) fn claude_file(root: &Path, relative: &Path) -> Option<PathBuf> {
     fs::read_dir(root.join("projects"))
         .ok()?
         .flatten()

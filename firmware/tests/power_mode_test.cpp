@@ -109,5 +109,13 @@ int main() {
     p.tick(50 * T); CHECK(!p.screenOn());
     CHECK(p.statuses(A, 50 * T)); CHECK(p.screenOn());
   }
+  { // Waiting for a task is quiet; asking the user afterwards must alert.
+    PowerMode p = armed(); p.tick(T);
+    std::vector<AgentStatus> task = {{"task", "waiting_task"}};
+    CHECK(!p.statuses(task, T + 1)); CHECK(!p.screenOn());
+    std::vector<AgentStatus> ask = {{"task", "waiting"}};
+    CHECK(p.statuses(ask, T + 2)); CHECK(p.screenOn());
+    CHECK(!p.statuses(task, T + 3)); CHECK(!p.alerting());
+  }
   puts("PASS: sleep mode rules");
 }

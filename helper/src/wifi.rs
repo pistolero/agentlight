@@ -246,14 +246,7 @@ fn serve(
             bail!("Revoked");
         }
         let mut s = state(collect(demo));
-        while serde_json::to_vec(&s)?.len() > 4096 && !s.agents.is_empty() {
-            if let Some(a) = s.agents.iter_mut().rev().find(|a| !a.children.is_empty()) {
-                a.children.pop();
-            } else {
-                s.agents.pop();
-                s.more += 1;
-            }
-        }
+        crate::fit_frame(&mut s)?;
         write_json(&mut tls, &serde_json::to_value(&s)?)?;
         let until = Instant::now() + Duration::from_secs(2);
         let mut answered = false;
