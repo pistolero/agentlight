@@ -907,6 +907,7 @@ fn codex_stopped_on_user(
             | "local_shell"
             | "apply_patch"
             | "bash"
+            | "background_process"
             | "edit"
             | "write"
             | "patch"
@@ -917,6 +918,11 @@ fn codex_stopped_on_user(
 }
 /// Whether a process descending from any Codex process started at or after
 /// `since`. Older ones (MCP servers, say) can't be running this tool call.
+/// Process start times are only good to about a second (boot time is whole
+/// seconds), and a command can appear to start just before its recorded call.
+fn started_for_call(started: u64, since: u64) -> bool {
+    started + 5 >= since
+}
 fn codex_process_started_since(since: u64) -> bool {
     process_started_since(since, &["codex"])
 }
@@ -961,7 +967,7 @@ fn process_started_since(since: u64, agents: &[&str]) -> bool {
         );
     }
     procs.iter().any(|(pid, (_, started, is_codex))| {
-        if *is_codex || *started < since {
+        if *is_codex || !started_for_call(*started, since) {
             return false;
         }
         let mut current = *pid;
@@ -1518,6 +1524,14 @@ mod tests {
             Some(1)
         );
         assert_eq!(codex_stopped_on_user(None, 5000, idle, false), None);
+    }
+    #[test]
+    fn a_command_can_appear_to_start_just_before_its_call() {
+        assert!(started_for_call(1000, 1000));
+        assert!(started_for_call(999, 1000)); // seen live: 0.6 s early
+        assert!(started_for_call(1100, 1000));
+        // An MCP server started long ago can't be running this call.
+        assert!(!started_for_call(900, 1000));
     }
     #[test]
     fn frames_drop_usage_before_sessions() {

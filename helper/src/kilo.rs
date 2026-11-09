@@ -104,7 +104,8 @@ fn status(db: &Connection, session: &str, at: u64) -> Option<(String, u64)> {
         "SELECT coalesce(json_extract(data,'$.role'),''),coalesce(json_extract(data,'$.error.name'),''),json_extract(data,'$.time.completed'),coalesce(json_extract(data,'$.finish'),''),time_updated FROM message WHERE session_id=?1 ORDER BY time_created DESC,id DESC LIMIT 1",
         [session],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).ok()?;
     let age = at.saturating_sub(completed.unwrap_or(updated) / 1000);
-    let base = if !error.is_empty() {
+    // A cancelled turn isn't a failure: it's over, and it's the user's move.
+    let base = if !error.is_empty() && error != "MessageAbortedError" {
         "error"
     } else if role == "assistant" && completed.is_some() && finish != "tool-calls" {
         if age >= 7200 {
@@ -140,7 +141,7 @@ fn tasks(db: &Connection, session: &str) -> Option<TaskProgress> {
 /// The newest tool still unfinished in the session's latest message.
 fn unfinished_tool(db: &Connection, session: &str) -> Option<(String, u64)> {
     db.query_row(
-        "SELECT json_extract(data,'$.tool'),coalesce(json_extract(data,'$.state.time.start'),time_updated) FROM part WHERE session_id=?1 AND message_id=(SELECT id FROM message WHERE session_id=?1 ORDER BY time_created DESC,id DESC LIMIT 1) AND json_extract(data,'$.type')='tool' AND json_extract(data,'$.state.status') IN ('pending','running') ORDER BY time_created DESC,id DESC LIMIT 1",
+        "SELECT json_extract(data,'$.tool'),coalesce(json_extract(data,'$.state.time.start'),time_updated) FROM part WHERE session_id=?1 AND message_id=(SELECT id FROM message WHERE session_id=?1 ORDER BY time_created DESC,id DESC LIMIT 1) AND json_extract(data,'$.type')='tool' AND json_extract(data,'$.state.status') IN ('pending','running') AND (json_extract(data,'$.tool')<>'background_process' OR json_extract(data,'$.state.input.action')='start') ORDER BY time_created DESC,id DESC LIMIT 1",
         [session],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)? / 1000)),
     )
@@ -437,6 +438,25 @@ mod tests {
         assert_eq!(a.id, "kilo:42");
     }
     #[test]
+    fn a_cancelled_turn_is_not_an_error_but_a_real_failure_is() {
+        let db = db();
+        session(&db, "root", None, 1000);
+        message(
+            &db,
+            "m",
+            "root",
+            1000_000,
+            serde_json::json!({"role":"assistant","error":{"name":"MessageAbortedError"},"time":{"completed":1000_000}}),
+        );
+        assert_eq!(status(&db, "root", 1010).unwrap().0, "waiting");
+        db.execute(
+            "UPDATE message SET data=json_set(data,'$.error.name','APIError')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(status(&db, "root", 1010).unwrap().0, "error");
+    }
+    #[test]
     fn a_stalled_tool_in_the_latest_message_is_found() {
         let db = db();
         session(&db, "root", None, 1000);
@@ -452,6 +472,23 @@ mod tests {
             )
             .unwrap();
         };
+        // Starting a background process can prompt; its other actions just wait.
+        let background = |id: &str, at: u64, action: &str| {
+            let data = serde_json::json!({"type":"tool","tool":"background_process","state":{"status":"running","input":{"action":action},"time":{"start":at}}});
+            db.execute(
+                "INSERT INTO part VALUES(?1,'m2','root',?2,?2,?3)",
+                rusqlite::params![id, at, data.to_string()],
+            )
+            .unwrap();
+        };
+        background("tail", 4000, "tail");
+        assert_eq!(unfinished_tool(&db, "root"), None);
+        background("start", 5000, "start");
+        assert_eq!(
+            unfinished_tool(&db, "root"),
+            Some(("background_process".into(), 5))
+        );
+        db.execute("DELETE FROM part", []).unwrap();
         // A tool left unfinished in an older message doesn't count.
         add("old", "m1", 1000, "running");
         assert_eq!(unfinished_tool(&db, "root"), None);
