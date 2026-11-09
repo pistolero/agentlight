@@ -2,6 +2,8 @@
 
 A touchscreen for your desk that shows what your coding agents are doing, and tells you when one needs you.
 
+![The Agentlight main screen, with a card for each coding agent session colored by status (example data)](docs/screenshot.png)
+
 Agentlight works with **Claude Code, Codex, OpenCode and Kilo**. A small helper program runs on your Linux computer and sends session status to the display over USB or encrypted Wi-Fi.
 
 It's based on the ideas and serial protocol of [managents](https://github.com/tonylook/managents).
