@@ -30,7 +30,15 @@ inline bool everConnected = false, usingWifi = false;
 
 inline bool fresh() { return everConnected && millis() - receivedAt < STALE_MS; }
 inline uint32_t elapsed(uint32_t age) { return age + (millis() - receivedAt) / 1000; }
-inline int pageCount() { return max(1, (agentCount + PAGE_SIZE - 1) / PAGE_SIZE); }
+// Idle sessions sit at the end of agents[] and stay hidden until asked for.
+inline bool showIdle = false;
+inline int idleCount() {
+  int count = 0;
+  for (int i = 0; i < agentCount; i++) if (agents[i].status == "idle") count++;
+  return count;
+}
+inline int visibleAgents() { return showIdle ? agentCount : agentCount - idleCount(); }
+inline int pageCount() { return max(1, (visibleAgents() + PAGE_SIZE - 1) / PAGE_SIZE); }
 inline const Agent *findAgent(const String &id) {
   for (int i = 0; i < agentCount; i++) if (agents[i].id == id) return &agents[i];
   return nullptr;
@@ -41,7 +49,7 @@ inline const Child *findChild(const Agent *a, const String &id) {
 }
 
 // Tap targets, rebuilt by every render. Later entries sit on top.
-enum Action : uint8_t { OpenAgent, OpenChild, NextPage, PrevPage, Back, Follow, ToggleSleep };
+enum Action : uint8_t { OpenAgent, OpenChild, NextPage, PrevPage, Back, Follow, ToggleSleep, ToggleIdle };
 struct Hit { int16_t x, y, w, h; uint8_t action; int8_t agent, child; };
 inline Hit hits[96];
 inline int hitCount = 0;

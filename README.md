@@ -53,6 +53,12 @@ page after 30 seconds. Until the first update arrives, and again after six
 seconds without one, a connection screen lists what the display is waiting for
 (Wi-Fi, helper) and how to fix it.
 
+## Idle sessions
+
+Idle sessions are hidden by default and sorted after all others. Tap the idle
+count in the top bar (for example "6 idle") to show or hide them. The display
+goes back to hiding them after a restart.
+
 ## Usage figures
 
 Each card shows usage as small text beside the project name; on small cards the

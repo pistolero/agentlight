@@ -197,7 +197,10 @@ bool parseState(JsonObjectConst root) {
       if (!ctx["limit"].isNull()) { if (!ctx["limit"].is<uint32_t>() || ctx["limit"].as<uint32_t>() == 0) return false; v.limit = ctx["limit"].as<uint32_t>(); }
     }
   }
-  for (int i = 0; i < n; i++) agents[i] = next[i];
+  // Idle sessions go last, keeping the helper's order within each group.
+  int placed = 0;
+  for (int idle = 0; idle < 2; idle++)
+    for (int i = 0; i < n; i++) if ((next[i].status == "idle") == (idle == 1)) agents[placed++] = next[i];
   agentCount = n;
   moreAgents = root["more"] | 0; hostTime = root["now"].as<uint64_t>(); tzOffset = root["tz"] | 0;
   receivedAt = millis(); everConnected = true;  // redraws follow from screenKey() changes
@@ -242,6 +245,7 @@ void act(const Hit &h) {
     case PrevPage: page = (page + pages - 1) % pages; break;
     case Back: closeLog(); break;
     case Follow: logView.follow = true; logView.scroll = logMaxScroll(); requestLog(); break;
+    case ToggleIdle: showIdle = !showIdle; page = 0; break;
     case ToggleSleep: {
       bool was = power.active();
       power.toggle(millis());

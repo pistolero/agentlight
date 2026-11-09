@@ -39,22 +39,29 @@ inline void topBar() {
   // Status summary, centered: one colored dot + count per status present.
   const char *keys[] = {"waiting", "error", "working", "waiting_task", "idle"};
   const char *names[] = {"need you", "error", "working", "waiting task", "idle"};
-  String labels[5]; uint16_t colors[5]; int n = 0, total = 0;
+  String labels[5]; uint16_t colors[5]; bool idle[5]; int n = 0, total = 0;
   for (int k = 0; k < 5; k++) {
     int count = 0;
     for (int i = 0; i < agentCount; i++) if (agents[i].status == keys[k]) count++;
     if (!count) continue;
     labels[n] = String(count) + " " + (k == 0 && count == 1 ? "needs you" : names[k]);
     colors[n] = statusStyle(keys[k]).color;
+    idle[n] = k == 4;
     total += 16 + canvas.textWidth(labels[n], font_s16) + (n ? 28 : 0);
     n++;
   }
   int x = WIDTH / 2 - total / 2;
   for (int i = 0; i < n; i++) {
     if (i) x += 28;
+    int width = 16 + canvas.textWidth(labels[i], font_s16);
+    if (idle[i]) {
+      // Tap target for showing idle sessions; highlighted while they're shown.
+      if (showIdle) canvas.fillRoundRect(x - 12, BAR / 2 - 15, width + 24, 30, 15, RAISED);
+      addHit(x - 14, 0, width + 28, BAR, ToggleIdle);
+    }
     canvas.fillCircle(x + 5, BAR / 2.f, 5, colors[i]);
-    canvas.text(x + 16, (BAR - font_s16.height) / 2, labels[i], font_s16, TEXT2);
-    x += 16 + canvas.textWidth(labels[i], font_s16);
+    canvas.text(x + 16, (BAR - font_s16.height) / 2, labels[i], font_s16, idle[i] && showIdle ? TEXT : TEXT2);
+    x += width;
   }
 
   // Local clock from the helper's time, plus the transport in use.
@@ -159,6 +166,11 @@ inline void card(int index, int x, int y, int w, int h) {
 inline void emptyState() {
   using namespace Theme;
   canvas.logo(512, 240, 18);
+  if (agentCount) {
+    canvas.textCenter(512, 280, "All sessions are idle", font_s28, TEXT);
+    canvas.textCenter(512, 326, "Tap the idle count above to show them.", font_s20, TEXT2);
+    return;
+  }
   canvas.textCenter(512, 280, "No active agent sessions", font_s28, TEXT);
   canvas.textCenter(512, 326, "Start Claude Code, Codex or OpenCode and it will appear here.", font_s20, TEXT2);
 }
@@ -171,8 +183,8 @@ inline String clockText() {
 inline uint32_t key() {
   FrameKey k; k.add(1u);
   k.add(uint32_t(power.active())); k.add(uint32_t(power.alerting()));
-  k.add(uint32_t(page)); k.add(uint32_t(agentCount)); k.add(uint32_t(moreAgents)); k.add(uint32_t(usingWifi)); k.add(clockText());
-  for (int i = page * PAGE_SIZE; i < min(agentCount, (page + 1) * PAGE_SIZE); i++) {
+  k.add(uint32_t(showIdle)); k.add(uint32_t(page)); k.add(uint32_t(agentCount)); k.add(uint32_t(moreAgents)); k.add(uint32_t(usingWifi)); k.add(clockText());
+  for (int i = page * PAGE_SIZE; i < min(visibleAgents(), (page + 1) * PAGE_SIZE); i++) {
     const Agent &a = agents[i];
     k.add(a.status); k.add(a.activity); k.add(a.name); k.add(a.kind); k.add(duration(elapsed(a.age)));
     k.add(a.tasksDone); k.add(a.tasksTotal); for (const UsagePart &part : usageParts(a)) k.add(part.text);
@@ -188,9 +200,9 @@ inline void draw() {
   topBar();
   int pages = pageCount();
   if (page >= pages) page = 0;
-  if (!agentCount) { emptyState(); return; }
+  if (!visibleAgents()) { emptyState(); return; }
 
-  int visible = min(PAGE_SIZE, agentCount - page * PAGE_SIZE);
+  int visible = min(PAGE_SIZE, visibleAgents() - page * PAGE_SIZE);
   int columns = visible <= 1 ? 1 : visible <= 4 ? 2 : 3;
   int rows = (visible + columns - 1) / columns;
   int top = BAR + MARGIN, bottom = HEIGHT - (pages > 1 ? 40 : MARGIN);

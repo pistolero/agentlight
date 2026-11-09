@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+mod kilo;
 mod logs;
 mod ota;
 mod usage;
@@ -185,7 +186,16 @@ fn fit_frame(s: &mut State) -> Result<Vec<u8>> {
     Ok(frame)
 }
 fn state(mut agents: Vec<Agent>) -> State {
-    agents.sort_by(|a, b| (&a.name, &a.kind, &a.id).cmp(&(&b.name, &b.kind, &b.id)));
+    // Idle sessions go last: the display hides them by default, and they're the
+    // first dropped when a frame or the agent cap overflows.
+    agents.sort_by(|a, b| {
+        (a.status == "idle", &a.name, &a.kind, &a.id).cmp(&(
+            b.status == "idle",
+            &b.name,
+            &b.kind,
+            &b.id,
+        ))
+    });
     let more = agents.len().saturating_sub(24);
     agents.truncate(24);
     // localtime_r accounts for the current timezone and daylight-saving time.
@@ -890,13 +900,29 @@ fn codex_stopped_on_user(
     }
     let approvable = matches!(
         name.as_str(),
-        "exec" | "exec_command" | "shell" | "shell_command" | "local_shell" | "apply_patch"
+        "exec"
+            | "exec_command"
+            | "shell"
+            | "shell_command"
+            | "local_shell"
+            | "apply_patch"
+            | "bash"
+            | "edit"
+            | "write"
+            | "patch"
+            | "multiedit"
+            | "webfetch"
     );
     (approvable && age >= 30 && !subworkers_active && !command_running(*since)).then_some(age)
 }
 /// Whether a process descending from any Codex process started at or after
 /// `since`. Older ones (MCP servers, say) can't be running this tool call.
 fn codex_process_started_since(since: u64) -> bool {
+    process_started_since(since, &["codex"])
+}
+/// Whether a process descending from one of the named agents started at or
+/// after `since`. Older ones (MCP servers, say) can't be running this tool call.
+fn process_started_since(since: u64, agents: &[&str]) -> bool {
     let boot = fs::read_to_string("/proc/stat")
         .ok()
         .and_then(|s| {
@@ -931,7 +957,7 @@ fn codex_process_started_since(since: u64) -> bool {
         };
         procs.insert(
             pid,
-            (parent, boot + start / ticks, head.ends_with("(codex")),
+            (parent, boot + start / ticks, agents.iter().any(|a| head.ends_with(&format!("({a}")))),
         );
     }
     procs.iter().any(|(pid, (_, started, is_codex))| {
@@ -1033,10 +1059,16 @@ fn process_sessions() -> Vec<Agent> {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        if executable != "opencode" && executable != "codex" {
+        if !matches!(executable, "opencode" | "codex" | "kilo" | ".kilo") {
             continue;
         }
-        if args.iter().skip(1).any(|s| {
+        let is_kilo = matches!(executable, "kilo" | ".kilo");
+        if is_kilo {
+            let args: Vec<_> = args.iter().map(|s| s.as_ref()).collect();
+            if !kilo::is_session_command(executable, &args) {
+                continue;
+            }
+        } else if args.iter().skip(1).any(|s| {
             matches!(
                 s.as_ref(),
                 "app-server" | "mcp-server" | "exec" | "serve" | "--help" | "--version"
@@ -1048,7 +1080,15 @@ fn process_sessions() -> Vec<Agent> {
             continue;
         };
         let dir = cwd.to_string_lossy();
-        if !seen.insert((executable.to_owned(), cwd.clone())) {
+        // Every Kilo terminal is its own card; other tools share one per folder.
+        if !is_kilo && !seen.insert((executable.to_owned(), cwd.clone())) {
+            continue;
+        }
+        if matches!(executable, "kilo" | ".kilo") {
+            let args: Vec<_> = args.iter().map(|s| s.as_ref()).collect();
+            if let Some(agent) = kilo::collect(pid, &dir, &args) {
+                result.push(agent);
+            }
             continue;
         }
         if executable == "opencode" {
@@ -1538,7 +1578,7 @@ mod tests {
         assert_eq!(s.agents.len(), 24);
     }
     #[test]
-    fn order_does_not_depend_on_status_age_or_input_order() {
+    fn idle_sessions_go_last_and_order_is_otherwise_stable() {
         let make = |id: &str, name: &str, status: &str, age| Agent {
             id: id.into(),
             kind: "opencode".into(),
@@ -1551,22 +1591,24 @@ mod tests {
             ctx: None,
             limits: vec![],
         };
-        let first = state(vec![
+        let ids = |s: &State| s.agents.iter().map(|a| a.id.clone()).collect::<Vec<_>>();
+        // Idle goes last, whatever its name.
+        let mixed = state(vec![
             make("b", "beta", "working", 1),
             make("a", "alpha", "idle", 500),
+        ]);
+        assert_eq!(ids(&mixed), vec!["b", "a"]);
+        // Among non-idle sessions, status, age and input order don't matter.
+        let first = state(vec![
+            make("b", "beta", "working", 1),
+            make("a", "alpha", "waiting", 500),
         ]);
         let second = state(vec![
             make("a", "alpha", "working", 0),
             make("b", "beta", "waiting", 9),
         ]);
-        assert_eq!(
-            first.agents.iter().map(|a| &a.id).collect::<Vec<_>>(),
-            vec!["a", "b"]
-        );
-        assert_eq!(
-            first.agents.iter().map(|a| &a.id).collect::<Vec<_>>(),
-            second.agents.iter().map(|a| &a.id).collect::<Vec<_>>()
-        );
+        assert_eq!(ids(&first), vec!["a", "b"]);
+        assert_eq!(ids(&first), ids(&second));
     }
     #[test]
     fn project_names_handle_worktrees_and_long_names() {

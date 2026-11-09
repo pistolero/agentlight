@@ -36,7 +36,7 @@ pub type Entry = (Role, String);
 
 /// Reduce to the display's ASCII font: transliterate common typography,
 /// drop emoji and symbols, and collapse runs of blank lines.
-fn clean(s: &str) -> String {
+pub(crate) fn clean(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
