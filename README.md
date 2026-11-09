@@ -1,325 +1,230 @@
 # Agentlight
 
-A USB desk dashboard for coding agents. The host helper is Rust on Linux; the
-firmware is Arduino C++ for the **Waveshare ESP32-S3-Touch-LCD-5B**, the
-1024 × 600 touch model (not the 800 × 480 5). Based on the ideas and serial
-protocol of [managents](https://github.com/tonylook/managents).
+A touchscreen for your desk that shows what your coding agents are doing, and tells you when one needs you.
 
-Also supports encrypted local Wi-Fi, automatic mDNS discovery and explicit
-per-display approval. USB remains available and takes priority while connected.
+Agentlight works with **Claude Code, Codex, OpenCode and Kilo**. A small helper program runs on your Linux computer and sends session status to the display over USB or encrypted Wi-Fi.
 
-## Build and flash
+It's based on the ideas and serial protocol of [managents](https://github.com/tonylook/managents).
 
-Requirements: Rust/Cargo, Python, PlatformIO Core, a USB data cable and the
-5B board. Building firmware downloads the ESP32 toolchain and dependencies.
+## What you need
+
+- A **Waveshare ESP32-S3-Touch-LCD-5B**, the 1024 × 600 touch model (not the 800 × 480 version)
+- A Linux computer with [Rust](https://rustup.rs/), Python and [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/index.html)
+- A USB data cable
+
+3D-printable cases are in [`enclosure/`](enclosure/README.md). **They're a work in progress**, so expect fit problems and changes.
+
+## Quick start
+
+**1. Flash the display.** Connect it over USB, then run this from the repository root:
 
 ```sh
-cargo build --release
-cargo test
 cd firmware
-pio run
 pio run -t upload
+cd ..
 ```
 
-If upload fails, hold BOOT while connecting the board, release BOOT, upload,
-then press RESET. To select a port, add `--upload-port /dev/ttyACM0` to the
-upload command. Linux users may need permission to access the serial device.
-Stop the helper before flashing; both cannot use the port at once.
+The first build downloads the ESP32 toolchain, so it takes a while.
 
-On the development machine PlatformIO is at
-`~/.platformio/penv/bin/pio`; use that path if `pio` isn't on PATH. Its
-Python environment must have compatible PlatformIO/esptool dependencies.
-
-## Run
+**2. Start the helper:**
 
 ```sh
-cargo run --release -- --demo       # synthetic cards, no agent access
-cargo run --release                 # actual sessions
-cargo run --release -- --port /dev/ttyACM0
-cargo run -- --once                 # print one JSON frame, no USB required
+cargo run --release
 ```
 
-Automatic discovery probes USB devices with Espressif's vendor ID (303a);
-use `--port` if the device isn't discovered. A device must answer the
-managents v1 hello handshake before it receives state. The helper reconnects
-after a disconnect.
+The display finds the helper by itself and your sessions appear within a few seconds. To try it without touching real sessions, run `cargo run --release -- --demo`.
 
-The top bar shows how many sessions are working or need you, the local time,
-and whether the display is on USB or Wi-Fi. Each session is a card tinted by
-status: working (green), needs you (amber), error (red) or idle (gray), with
-its task and context progress and its subagents. With more than nine sessions,
-swipe or tap the page dots to change pages; the display returns to the first
-page after 30 seconds. Until the first update arrives, and again after six
-seconds without one, a connection screen lists what the display is waiting for
-(Wi-Fi, helper) and how to fix it.
+## Using the display
 
-## Idle sessions
+Each session is a card, colored by status:
 
-Idle sessions are hidden by default and sorted after all others. Tap the idle
-count in the top bar (for example "6 idle") to show or hide them. The display
-goes back to hiding them after a restart.
+| Status | Color | Meaning |
+|---|---|---|
+| **WORKING** | Green | The agent is busy |
+| **NEEDS YOU** | Amber | It's waiting for your input or permission |
+| **WAITING TASK** | Blue | It's blocked on a command, task or worker it started |
+| **ERROR** | Red | Its last turn failed |
+| **IDLE** | Gray | Nothing has happened for 2 hours |
 
-## Usage figures
+The top bar shows a count for each status, the time, and whether the display is on USB or Wi-Fi.
 
-Each card shows usage as small text beside the project name; on small cards the
-name shortens to make room. Figures are muted normally, amber at 80% and red at
-95%.
+| To do this | Do this |
+|---|---|
+| Read a session's live conversation | Tap its card |
+| Read a subagent's conversation | Tap its pill on the card |
+| Scroll back through a log | Drag; tap **Jump to latest** to follow again |
+| Show or hide idle sessions | Tap the idle count in the top bar, such as `6 idle` |
+| Change page, with more than nine sessions | Swipe, or tap the page dots |
+| Turn on sleep mode | Tap the moon in the top bar |
 
-| Tool | Context | Plan limits |
+Idle sessions are hidden by default, and hidden again after a restart.
+
+### Usage figures
+
+Each card shows usage as small text next to the project name. The figures turn amber at 80% and red at 95%.
+
+| Agent | Context | Plan limits |
 |---|---|---|
 | Claude Code | `ctx 52%` | Not shown |
 | Codex | `ctx 27%` | `5h 42%`, `7d 1%` |
 | OpenCode | `ctx 490k` (tokens) | Not shown |
+| Kilo | `ctx 490k` (tokens) | Not shown |
 
-- `ctx` is how full that session's context was at its last response. OpenCode
-  doesn't record a context size locally, so it shows tokens instead of a percent.
-  So does a Claude model missing from Claude Code's local model catalog.
-- Codex plan limits apply to the account, so all Codex cards show the newest
-  reading. A window past its reset time is hidden rather than shown out of date.
-- Claude Code gives its plan limits only to a status line script, and the helper
-  doesn't install one, so they aren't shown.
-- All figures come from local files; the helper makes no extra network requests.
+- `ctx` is how full the session's context was at its last response. When no context size is available, you see tokens instead of a percent.
+- Codex plan limits apply to your whole account, so every Codex card shows the same numbers.
+- Claude Code only gives its plan limits to a status line script, and Agentlight doesn't install one.
 
-## Sleep mode
+### Sleep mode
 
-Tap the moon in the top bar to save power, for example on a powerbank. The
-screen turns off after 5 minutes without a touch, while the display keeps
-listening for status over USB or Wi-Fi. The mode survives restarts and updates.
+Sleep mode turns the screen off when nothing needs you, which is useful on a powerbank. In one test it cut power from 2.2 W to 0.7 W.
 
-- A touch turns the screen back on and does nothing else. The 5 minutes then
-  start again, and the mode stays on.
-- When a session newly needs you (NEEDS YOU or ERROR), the screen turns on, any
-  open log closes, and the moon becomes an amber **Sleep** button. The screen
-  then stays on, even if you touch it, until that session's status changes or
-  you tap **Sleep**. Either way the 5 minutes start again.
-- Sessions already needing you when you turn the mode on, or when you tap
-  **Sleep**, don't wake the screen unless they leave that status and return.
-- To leave the mode, tap the highlighted moon. During an alert that takes two
-  taps: **Sleep**, then the moon.
+Tap the moon to turn it on. The screen turns off after 5 minutes without a touch.
 
-Claude Code and OpenCode sessions report NEEDS YOU for 2 hours after going idle,
-then IDLE, so an alert nobody answers ends by itself after up to 2 hours. A
-newly started session also counts, because it's waiting for you.
+- **Touching the screen** wakes it, and that touch doesn't press anything. The 5 minutes then start again.
+- **When a session newly needs you** (NEEDS YOU or ERROR), the screen turns on and stays on until that session's status changes. The moon becomes an amber **Sleep** button: tap it to go back to sleep without waiting.
+- **To leave sleep mode,** tap the highlighted moon. During an alert, tap **Sleep** first, then the moon.
 
-**A dark screen doesn't prove the helper is connected.** If the helper is lost
-while the screen is off, it stays off to save power, and a touch shows the
-connection screen. Sessions that started needing you meanwhile wake the screen
-when the helper reconnects.
+Sleep mode stays on after a restart.
 
-## Wi-Fi: setup requires explicit approval
+> A dark screen doesn't prove the helper is connected. If the helper stops while the screen is off, the screen stays off. Touch it to check. Anything that needed you in the meantime wakes the screen once the helper reconnects.
 
-The board supports **2.4 GHz Wi-Fi**. Initial setup is over a trusted physical
-USB connection; it is not an open pairing web page or an unauthenticated Wi-Fi
-pairing request. This also selects which helper to discover when several exist.
+Some powerbanks switch off when the current draw is low. With the screen off the display draws only about 140 mA, so check that yours stays on.
 
-1. Flash the Wi-Fi firmware. Stop the running USB helper so setup can open its
-   serial port (Ctrl+C if running it in your terminal).
-2. Run, substituting your port:
+## Wi-Fi
 
-   ```sh
-   cargo run --release -- --wifi-setup --port /dev/ttyACM0
-   ```
+Use Wi-Fi to run the display from a charger, with no USB data connection. The board supports **2.4 GHz networks only**.
 
-3. Check the displayed device ID. The program explains remote access and
-   requires you to type **APPROVE**. Any other answer cancels. Then enter the
-   network name and Wi-Fi password; the password is hidden and not put into
-   shell arguments or source code. `--ssid` can optionally supply the network
-   name, but never put your password in a command.
-4. Start the helper:
+Setup happens once over USB, so a display can't be paired from the network.
 
-   ```sh
-   cargo run --release -- --wifi --wifi-only
-   ```
+**1. Stop any helper that's running**, because setup needs the USB port.
 
-   The display discovers the approved helper with mDNS (`_agentlight._tcp`),
-   verifies its pinned certificate and authenticates. No IP entry is needed.
-   Power the display from a charger to use it without a USB data connection.
-   Use `--wifi` without `--wifi-only` to also serve connected USB displays.
+**2. Run setup,** using your own port:
 
-The current transport is indicated by USB/Wi-Fi at the bottom left. Wi-Fi
-reconnects automatically, and USB updates take priority when both are present.
-The display stores its setup across power cycles.
+```sh
+cargo run --release -- --wifi-setup --port /dev/ttyACM0
+```
+
+Check the device ID it shows, type `APPROVE`, then enter your network name and password. The password isn't echoed.
+
+**3. Start the helper in Wi-Fi mode:**
+
+```sh
+cargo run --release -- --wifi --wifi-only
+```
+
+The display finds the helper by itself; there's no IP address to enter. Leave out `--wifi-only` to serve USB displays as well. When both are connected, USB takes priority.
+
+To change network or helper, repeat setup.
+
+### Managing approved displays
 
 ```sh
 cargo run --release -- --wifi-list
 cargo run --release -- --wifi-revoke '28:84:85:A2:8F:C4'
 ```
 
-Revocation disconnects active network access within a few seconds. It does not
-disable physically connected USB access. To change Wi-Fi networks or helpers,
-repeat USB setup and explicitly approve again.
+Revoking cuts off network access within a few seconds. It doesn't affect a display connected by USB.
 
-### Wireless firmware updates
+### Updating the firmware over Wi-Fi
 
-Approved Wi-Fi displays can be updated without a USB data connection:
+Build the firmware and give it to the helper:
 
 ```sh
-cd firmware && pio run && cd ..
+(cd firmware && pio run)
 cargo run --release -- --wifi --wifi-only --ota firmware/.pio/build/waveshare_5b/firmware.bin
 ```
 
-When an approved display connects with a different build, the helper installs
-the image automatically. The display shows a full-screen progress bar with
-size, percentage and time remaining, then restarts into the new firmware. The
-helper prints a matching progress line. Each build is identified by
-`FW_VERSION` in `firmware/platformio.ini` plus its compile time. A build
-recompiles, and so counts as new, only when the source or build flags change.
+Approved displays running a different build update automatically. You'll see a progress bar, then the screen goes dark for a few seconds while it installs, and it restarts.
 
-- The first firmware with update support must be flashed once over USB
-  (`pio run -t upload`). Older displays are skipped with a message.
-- The image is downloaded into PSRAM and checked with SHA-256 before any flash
-  is written. A failed or interrupted transfer leaves the current firmware
-  running.
-- Writing flash stalls the panel's PSRAM reads and makes the picture jump, so
-  the screen shows a short notice and goes dark for that step (a few seconds)
-  before restarting. The download itself shows a steady progress bar.
-- A new image must reach an approved helper within 3 minutes of booting. If
-  it doesn't, the display rolls back to the previous firmware. An image that
-  hangs very early in boot rolls back on the next power cycle. The helper
-  stops retrying a display after 2 attempts per run.
-- Updates are accepted only over the pinned, approved helper connection.
-  Images are not code-signed (ESP32 Secure Boot is not enabled), so anyone who
-  controls the approved helper account can install firmware.
+Updates are built to fail safely. The image is checked before anything is written, so an interrupted download changes nothing. A new build that can't reach the helper within 3 minutes rolls back to the previous one, and one that hangs at startup rolls back on the next power cycle.
 
-### Network security and limitations
+## Commands
 
-- Remote access is **off unless the helper is started with `--wifi`**. Discovery
-  advertises the helper identity, not session data; discovering a display never
-  approves it. There is no remote auto-approve path.
-- A separate random 256-bit credential is issued for each approved display.
-  The display verifies the server certificate's SHA-256 pin **before** sending
-  that credential. A spoofed mDNS reply cannot establish trust. Encryption and
-  pinning do not depend on Internet access or an NTP clock.
-- Approval grants status/task/subagent access and requested log excerpts. Treat
-  the physical display as a trusted device: people nearby can read its screen.
-- Helper keys and permissions live under `$XDG_CONFIG_HOME/agentlight` (normally
-  `~/.config/agentlight`), with directory mode 0700 and file mode 0600. Do not
-  publish those files. Losing the helper identity requires USB re-pairing.
-- The display's Wi-Fi password and credential are stored in **unencrypted NVS**;
-  this is not protection against someone physically reading its flash. Firmware
-  does not log them. Factory flash encryption/secure boot is not configured.
-- Discovery needs UDP 5353 multicast on the LAN; the TLS server listens on TCP
-  **47832**. Client isolation, guest Wi-Fi or a firewall can prevent discovery
-  or connection. No firewall rules or port forwarding are changed automatically.
-  Do not expose this experimental service to the public Internet.
-- The helper limits simultaneous network connections to two. Current tests
-  cover TLS, rejection, authorized status/log access and revocation, but Wi-Fi
-  provisioning and sustained display operation need testing on your network.
+All of these start with `cargo run --release --`:
 
-## Detection and privacy
+| Option | What it does |
+|---|---|
+| *(none)* | Show your sessions on a USB display |
+| `--demo` | Show sample sessions instead of real ones |
+| `--port /dev/ttyACM0` | Use a specific serial port |
+| `--once` | Print one status frame as JSON and exit |
+| `--wifi` | Also serve approved displays over Wi-Fi |
+| `--wifi --wifi-only` | Serve Wi-Fi only and leave the USB port free |
+| `--wifi --ota FILE` | Install this firmware on approved displays |
+| `--wifi-setup --port PORT` | Pair a display over USB (`--ssid NAME` sets the network) |
+| `--wifi-list` | List approved displays |
+| `--wifi-revoke ID` | Remove a display's access |
 
-This is a first implementation, not full managents parity:
+## Troubleshooting
 
-- Claude Code: live `~/.claude/sessions` registry and process liveness; busy,
-  waiting and idle states. Its registry `name` is shown as the activity line;
-  the project is derived from the working directory (including worktrees).
-  Running subagents from per-session metadata and recently finished or stopped
-  subagents are shown within the parent card. When Claude's task list is available,
-  the card shows completed/total tasks and a progress bar. Shared lists configured
-  via `CLAUDE_CODE_TASK_LIST_ID` are used when visible in the process environment.
-  Registry PID reuse is not currently checked.
-  Parked terminal placeholders and idle detached background jobs are excluded;
-  background jobs attached to an open terminal, working, or waiting for input
-  are retained. Distinct active sessions are not merged by project directory.
-- OpenCode: live processes and the most recent message for each open TUI tab
-  from the OpenCode 1 or 2 SQLite database. Tab titles are displayed as the
-  activity line; they are session titles, not necessarily live tool activity.
-  Direct child sessions with recorded busy/idle times appear as subagents.
-  Without tab state, a folder gets one fallback card and no nested children.
-- Codex: live processes, the latest thread for the working directory, and
-  task events in the end of its rollout. Saved session names (or titles on older
-  versions) are displayed as the activity line. Internal subagent threads are
-  excluded from this selection. Direct subworkers are linked by their recorded
-  parent thread, including workers in other worktrees. Their task names and
-  rollout lifecycle events supply the child labels and running/completed status;
-  completed, interrupted and failed workers expire after two minutes.
-  Approval prompts are not detected, and a stale prior rollout can give a
-  misleading status. Context usage is
-  not sent by the helper yet.
+| Problem | Try this |
+|---|---|
+| The upload fails | Hold BOOT while connecting the board, release it, upload, then press RESET |
+| The port is busy | Stop the helper first; only one program can use the port at a time |
+| Permission denied on the port | Add your user to the group that owns it, usually `dialout` |
+| The display isn't found over USB | Name the port with `--port /dev/ttyACM0` |
+| `pio` isn't found or won't start | Use `~/.platformio/penv/bin/pio` |
+| Upload error mentioning `get_metavar` | Run `~/.platformio/penv/bin/pip install "click<8.2.0"` |
+| The display can't find the helper over Wi-Fi | Check it's on the same 2.4 GHz network. Guest Wi-Fi, client isolation or a firewall can block UDP 5353 and TCP 47832 |
+| A status looks wrong | Agent formats change between versions, and some states are inferred. See [How sessions are detected](#how-sessions-are-detected) |
 
-Agent data formats change; unreadable or unavailable sources fall back to a
-waiting card where possible. The helper reads metadata from local state. By
-default it uses only USB; `--wifi` enables LAN discovery and encrypted remote
-access for explicitly approved devices. Agent IDs, project names, status, timing,
-Claude registry names, OpenCode tab titles and Codex session names/titles go over
-USB. These activity/title fields may contain user-provided or conversation-derived
-text and are visible on the display; subagent names and descriptions are also sent.
-Full paths are not sent.
-**Tapping a session explicitly requests its recent messages, which then go over
-USB and are visible on the screen.** Excerpts can contain sensitive user or
-assistant text; there is no automatic secret redaction. Reasoning blocks and
-tool arguments/results are omitted. Codex status detection scans backwards in
-256 KiB chunks for lifecycle events; log excerpts read only the last 256 KiB.
-Environment variables
-`CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_DATA_HOME` select data directories.
+## Privacy and security
 
-The firmware accepts the subset of the [managents v1 protocol](https://github.com/tonylook/managents/blob/main/docs/protocol.md)
-used here, including optional context bars. Full protocol validation, automatic
-backlight dimming, multi-display broadcasting and service installation are not
-implemented. Automatic discovery opens candidate serial ports to probe them;
-use `--port` to target one device explicitly.
+**What the display shows:** session names, project folder names, status and timing, subagent names, and usage figures. Full paths aren't sent. Everything comes from local files, and the helper doesn't send it anywhere except your display.
 
-Up to six subagents appear per parent as pills; completed children remain for
-approximately two minutes. Their times are based on the last available local
-metadata timestamp and may not represent their exact start time.
+**Logs:** a session's recent messages are read only when you tap it, and then appear on the screen. They can contain sensitive text, and nothing is redacted. Reasoning and tool arguments and results are left out. Anyone near the display can read it.
 
-Tap a session card, or one of its subagent pills, to open that conversation's
-live log. Messages appear chat style (you, the agent, and tool calls as small
-chips). While open, the display requests updates every two seconds and follows
-the newest message. Drag to scroll back, which pauses following; tap "Jump to
-latest" or the Paused badge to resume, and Back to return. This shows
-persisted messages, not a terminal screen or complete raw log: at most 30
-text/tool-name entries that fit one 4 KB frame; an oldest entry that does not
-fit is trimmed at its start and marked `...`. Common Unicode punctuation is
-converted to ASCII for the display font. Claude Code sessions and subagents and
-OpenCode 2 tabs and child sessions are supported; Codex uses the same
-latest-thread-per-folder selection as its status detector and supports direct
-subworker logs. Unavailable sources show an explanation. Nothing is read for a log until
-requested, and device requests must identify a currently sent session or
-subagent.
+**Wi-Fi:**
+- It's **off unless you start the helper with `--wifi`**, and a display can only be approved over USB.
+- The connection is encrypted with TLS. Each display gets its own random credential, and it checks the helper's pinned certificate before sending it.
+- The helper's keys are in `~/.config/agentlight`, readable only by you. Don't publish them. If you lose them, pair the display again.
+- Don't expose this service to the internet. Agentlight doesn't change firewall rules.
 
-## Display driver workaround
+**Limits:**
+- The Wi-Fi password and credential are stored **unencrypted on the display**, so someone with physical access could read them.
+- Firmware updates aren't code-signed. Anyone who controls your approved helper account can install firmware.
 
-The firmware works around an ESP-IDF RGB driver problem. With
-`CONFIG_LCD_RGB_RESTART_IN_VSYNC`, which the precompiled Arduino libraries set,
-the driver restarts output from bounce buffer 0 each frame but never resets
-`bb_eof_count`, the count that picks which buffer to refill. One lost interrupt
-leaves it odd until the next restart, and the picture stays shifted with stale
-slices at the left of the screen.
+## How sessions are detected
 
-`firmware/src/main.cpp` zeroes the count at every VSYNC, as the driver's other
-configuration does. The field is private, so `locateEofCount()` finds it in memory
-at startup and turns the workaround off if the check fails. **A platform update
-can change this:** if steady tearing returns after one, check the workaround first.
+| Agent | Source | Good to know |
+|---|---|---|
+| Claude Code | `~/.claude/sessions` and transcripts | Shows tasks, subagents and logs |
+| Codex | Its thread database and session files | Permission prompts are inferred. Shows subworkers and logs |
+| OpenCode | Its SQLite database and open tabs | Shows subagents and logs |
+| Kilo | Its SQLite database | Shows its todo list and subagents. Permission prompts are inferred. **Logs aren't available yet** |
 
-Clock speed doesn't affect this problem, but it does affect Wi-Fi: encrypted logins
-fail at 21 MHz, so the display drops to 14 MHz while connecting or updating. The
-screen goes dark during flash writes because they stall the panel badly regardless.
+Some things can't be read directly:
 
-## Hardware validation
+- **Codex and Kilo don't record permission prompts** where Agentlight can see them. A session counts as waiting when a command-type tool has had no result for 30 seconds, no process has started for it, and no subagent is active. So a prompt can take up to 30 seconds to appear, and another busy session can occasionally hide one.
+- **Kilo doesn't record which terminal owns which session.** With several terminals in one folder, Agentlight pairs them in start order, which can be wrong if you switch sessions inside a terminal.
+- **After a session goes quiet,** it shows NEEDS YOU for 2 hours and then IDLE, so an alert nobody answers ends by itself.
+- **A new session counts as needing you,** because it's waiting for your first message.
 
-The firmware builds against the 5B board configuration from
-ESP32_Display_Panel (ST7262 RGB, GT911 touch, CH422G I/O expander). It uses a
-two PSRAM panel framebuffers and swaps them at refresh boundaries, rather than
-copying into the active scanout buffer. RGB runs at a conservative 14 MHz with
-20-line internal bounce buffers to leave bandwidth for Wi-Fi. Before relying on
-it, test on the actual board: colors, touch, USB reconnection, longer operation
-and RGB drift/tearing. Build success alone does not verify these behaviors.
+If a data source can't be read, you'll usually see a waiting card rather than an error. Set `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME` or `KILO_DB` to use non-default data locations.
 
-### Waiting for tasks versus user input
+## Development
 
-WAITING TASK (blue) means a recorded blocking call is waiting for its referenced
-command, task or worker. NEEDS YOU (amber) remains the status for user input;
-an explicit question takes priority even when other work continues. Task waits
-do not wake the screen or hold a Sleep-mode attention alert.
+```sh
+cargo test                                # helper unit tests
+(cd firmware && pio run)                  # build firmware (avoid -v, it breaks the image step)
+python3 helper/tests/wifi_transport.py    # needs a release build and a free port 47832
+python3 helper/tests/ota_transport.py     # same
+```
 
-Claude tool calls/results, Codex call IDs/arguments/results, and OpenCode tool
-parts supply the dependency evidence. Completed calls, interrupted turns and new
-turns clear it. Nonblocking polls and unattended background launches such as the
-Agentlight helper do not count. In-flight counts or active workers alone are not
-proof of a dependency: when evidence is absent or unsupported, the normal
-provider status remains. Excerpts used for detection stay local.
+To test the sleep-mode rules, run this from `firmware/`:
 
-The new `waiting_task` parent status requires firmware 0.5.10 or later. Upgrade
-the display with the previous helper before starting a helper that emits it;
-older firmware rejects frames containing unknown parent statuses.
+```sh
+g++ -std=c++17 -Iinclude tests/power_mode_test.cpp -o .pio/power_mode_test && .pio/power_mode_test
+```
+
+A build counts as new, and gets offered as an update, only when its source or build flags change. The firmware accepts the part of the [managents v1 protocol](https://github.com/tonylook/managents/blob/main/docs/protocol.md) used here. The `WAITING TASK` status needs firmware 0.5.10 or later, so update the display before the helper.
+
+### Display notes
+
+Hardware: ST7262 RGB panel, GT911 touch and CH422G I/O expander, using ESP32_Display_Panel's 5B configuration.
+
+**Driver workaround.** With `CONFIG_LCD_RGB_RESTART_IN_VSYNC`, which the precompiled Arduino libraries set, the ESP-IDF RGB driver never resets `bb_eof_count`, the count that picks which bounce buffer to refill. One lost interrupt leaves it odd until the next restart, and the picture stays shifted with stale slices at the left of the screen. `firmware/src/main.cpp` zeroes the count every VSYNC, as the driver's other configuration does. The field is private, so `locateEofCount()` finds it at startup and turns the workaround off if its check fails. **If steady tearing returns after a platform update, check this first.**
+
+**Pixel clock.** The panel normally runs at 21 MHz, about 24 Hz, because lower speeds visibly shimmer. It drops to 14 MHz while connecting or updating, because encrypted logins fail at 21 MHz (over 8 forced reconnects: 9 failed attempts at 21 MHz, none at 14 MHz), and to 8 MHz while the screen is off.
+
+**Flash writes** stall the panel badly whatever the clock, which is why the screen goes dark while an update installs.

@@ -1,5 +1,7 @@
 # Black-glass Waveshare 5B case — printable revision 2
 
+> **Work in progress.** These designs are still changing and may not fit or print correctly.
+
 Use these files, **not the first prototype in the parent directory**.
 
 | Print file | Bed orientation (already exported this way) | Size |

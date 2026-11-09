@@ -1,5 +1,7 @@
 # Waveshare 5B enclosure and adjustable-angle cradle
 
+> **Work in progress.** These designs are still changing and may not fit or print correctly.
+
 Three printable parts make up the enclosure:
 
 1. **Housing:** a front bezel with an open back. The display is inserted from
