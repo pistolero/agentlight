@@ -127,7 +127,9 @@ fn context(db: &Connection, session: &str) -> Option<Ctx> {
     Some(Ctx { used, limit: None })
 }
 /// Progress of the session's built-in todo list. As with Claude's tasks, only
-/// open and finished items count; cancelled ones leave the total.
+/// open and finished items count; cancelled ones leave the total. Kilo keeps a
+/// finished list in the table after it stops showing it, so a list with nothing
+/// left to do counts as no list.
 fn tasks(db: &Connection, session: &str) -> Option<TaskProgress> {
     let (completed, total): (u32, u32) = db
         .query_row(
@@ -136,7 +138,7 @@ fn tasks(db: &Connection, session: &str) -> Option<TaskProgress> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .ok()?;
-    (total > 0).then_some(TaskProgress { completed, total })
+    (completed < total).then_some(TaskProgress { completed, total })
 }
 /// The newest tool still unfinished in the session's latest message.
 fn unfinished_tool(db: &Connection, session: &str) -> Option<(String, u64)> {
@@ -539,6 +541,8 @@ mod tests {
                 total: 3
             })
         );
+        // A fully finished list stays in the table but is no longer shown.
+        assert_eq!(tasks(&db, "other"), None);
     }
     #[test]
     fn lifecycle_and_confirmed_dependencies_use_current_parent_only() {
