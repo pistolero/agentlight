@@ -120,7 +120,7 @@ To change network or helper, repeat setup.
 
 ```sh
 cargo run --release -- --wifi-list
-cargo run --release -- --wifi-revoke '28:84:85:A2:8F:C4'
+cargo run --release -- --wifi-revoke 'AA:BB:CC:DD:EE:FF'
 ```
 
 Revoking cuts off network access within a few seconds. It doesn't affect a display connected by USB.
