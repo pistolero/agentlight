@@ -278,18 +278,73 @@ fn active_sessions(db: &Connection, dir: &str, count: usize) -> Vec<String> {
 /// the session it creates.
 fn session_for_terminal(db: &Connection, dir: &str, pid: u32) -> Option<String> {
     let terminals = terminals(dir);
-    if terminals.len() < 2 {
-        return None;
-    }
     let place = terminals.iter().position(|p| *p == pid)?;
     active_sessions(db, dir, terminals.len())
         .into_iter()
         .nth(place)
 }
+/// When a process started, in seconds since the epoch.
+fn process_started(pid: u32) -> Option<u64> {
+    let boot = fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok())?;
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let start: u64 = stat
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()?;
+    Some(boot + start / unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64)
+}
+/// `-s` only names the session a terminal opened on. Implementing a plan or
+/// starting afresh moves the terminal to a new session, and Kilo doesn't record
+/// that. So follow the directory's most active session if it was created after
+/// the terminal started.
+fn followed_session(
+    db: &Connection,
+    dir: &str,
+    opened: &str,
+    terminal_started: u64,
+) -> Option<String> {
+    let newest = active_sessions(db, dir, 1).into_iter().next()?;
+    let created: u64 = db
+        .query_row(
+            "SELECT time_created FROM session WHERE id=?1",
+            [&newest],
+            |r| r.get(0),
+        )
+        .ok()?;
+    (newest != opened && created / 1000 >= terminal_started).then_some(newest)
+}
+/// The session named on the command line, if it still exists here. One that
+/// has since been deleted mustn't cost the terminal its card.
+fn opened_session(db: &Connection, dir: &str, args: &[&str]) -> Option<String> {
+    session_arg(args).filter(|s| parent(db, dir, Some(s)).is_some())
+}
 pub fn collect(pid: u32, dir: &str, args: &[&str]) -> Option<Agent> {
     let db = database(pid)?;
-    let selected = session_arg(args).or_else(|| session_for_terminal(&db, dir, pid));
-    agent(&db, pid, dir, selected.as_deref(), crate::now())
+    let opened = opened_session(&db, dir, args);
+    // With other terminals in the directory, a new session could be theirs.
+    let followed = opened.as_deref().filter(|_| terminals(dir).len() == 1).and_then(|o| {
+        followed_session(&db, dir, o, process_started(pid)?)
+    });
+    let selected = followed
+        .clone()
+        .or_else(|| opened.clone())
+        .or_else(|| session_for_terminal(&db, dir, pid));
+    let mut found = agent(&db, pid, dir, selected.as_deref(), crate::now())?;
+    // A session started from a plan keeps Kilo's placeholder title: keep the
+    // name the card already had.
+    let placeholder = found.activity.as_deref().is_some_and(|a| a.starts_with("New session - "));
+    if followed.is_some() && placeholder {
+        if let Some((_, title)) = parent(&db, dir, opened.as_deref()) {
+            found.activity = activity(&title);
+        }
+    }
+    Some(found)
 }
 fn entries(db: &Connection, parent: &str, child: Option<&str>) -> Option<Vec<Entry>> {
     let session = child.unwrap_or(parent);
@@ -515,6 +570,36 @@ mod tests {
             vec!["old", "first", "second"]
         );
         assert!(active_sessions(&db, "/other", 2).is_empty());
+    }
+    #[test]
+    fn a_deleted_command_line_session_is_ignored() {
+        let db = db();
+        session(&db, "kept", None, 1000);
+        let args = |id| vec!["kilo", "-s", id];
+        assert_eq!(
+            opened_session(&db, "/project", &args("kept")).as_deref(),
+            Some("kept")
+        );
+        assert_eq!(opened_session(&db, "/project", &args("gone")), None);
+    }
+    #[test]
+    fn a_terminal_follows_a_session_created_after_it_started() {
+        let db = db();
+        session(&db, "opened", None, 1_000_000);
+        message(&db, "a", "opened", 2_000_000, serde_json::json!({}));
+        // Nothing newer yet: stay on the session named on the command line.
+        assert_eq!(followed_session(&db, "/project", "opened", 1500), None);
+        session(&db, "plan", None, 3_000_000);
+        message(&db, "b", "plan", 4_000_000, serde_json::json!({}));
+        assert_eq!(
+            followed_session(&db, "/project", "opened", 1500).as_deref(),
+            Some("plan")
+        );
+        // That session already existed when this terminal started.
+        assert_eq!(followed_session(&db, "/project", "opened", 3500), None);
+        // Going back to the first session moves the card back.
+        message(&db, "c", "opened", 5_000_000, serde_json::json!({}));
+        assert_eq!(followed_session(&db, "/project", "opened", 1500), None);
     }
     #[test]
     fn todo_list_counts_open_and_finished_items_of_that_session_only() {
