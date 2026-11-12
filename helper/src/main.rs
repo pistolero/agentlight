@@ -96,6 +96,9 @@ struct Child {
     age: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     activity: Option<String>,
+    /// Seconds since the subagent last showed activity. Not sent.
+    #[serde(skip)]
+    quiet: u64,
 }
 #[derive(Serialize)]
 struct State {
@@ -255,6 +258,22 @@ impl Claude {
             _ => true,
         }
     }
+    fn base_status(&self, age: u64) -> &'static str {
+        if self.waiting() || self.status == "waiting" {
+            "waiting"
+        } else if self.status == "busy" {
+            "working"
+        } else if self.status == "shell" {
+            // At the prompt, but a background shell command it started is
+            // still running. Claude Code's own session list counts this as
+            // running, not as needing you.
+            "waiting_task"
+        } else if age >= 7200 {
+            "idle"
+        } else {
+            "waiting"
+        }
+    }
     // A shell parked on a background job is shown through that job's record.
     // Idle background jobs stay visible even with no terminal attached; empty
     // daemon placeholders are removed by the history check in claude_sessions.
@@ -335,14 +354,13 @@ fn claude_sessions() -> Vec<Agent> {
                 .unwrap_or(now() * 1000);
             let age = now().saturating_sub(ms / 1000);
             let waiting = r.waiting();
+            let children = claude_children(&r.session_id);
+            let status = r.base_status(age);
+            // Background subagents run on after the turn that started them.
             let status = if waiting || r.status == "waiting" {
-                "waiting"
-            } else if r.status == "busy" {
-                "working"
-            } else if age >= 7200 {
-                "idle"
+                status
             } else {
-                "waiting"
+                at_prompt_status(status, || subagents_busy(&children))
             };
             let (status, age) = if waiting || r.status == "waiting" {
                 (status.into(), age)
@@ -356,7 +374,7 @@ fn claude_sessions() -> Vec<Agent> {
                 activity: activity(&r.name),
                 status: status.into(),
                 age,
-                children: claude_children(&r.session_id),
+                children,
                 tasks: claude_tasks(&r.session_id, r.pid),
                 ctx: usage::claude_context(&r.session_id),
                 limits: vec![],
@@ -456,7 +474,13 @@ fn claude_children_at(session_id: &str, root: &Path, at: u64) -> Vec<Child> {
         let directory = project.path().join(session_id).join("subagents");
         for file in fs::read_dir(directory).into_iter().flatten().flatten() {
             let path = file.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            // Each subagent has one agent-<id>.meta.json. Other JSON files
+            // beside it (a forked skill's, say) describe the same subagent.
+            let is_meta = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.ends_with(".meta.json"));
+            if !is_meta {
                 continue;
             }
             let Some(meta) = fs::read(&path)
@@ -483,12 +507,25 @@ fn claude_children_at(session_id: &str, root: &Path, at: u64) -> Vec<Child> {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("subagent");
+            // A working subagent writes its transcript as it goes.
+            let transcript = path.with_file_name(format!(
+                "{}.jsonl",
+                id.strip_suffix(".meta").unwrap_or(id)
+            ));
+            let written = transcript
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|t| t.as_secs())
+                .unwrap_or(0);
             result.push(Child {
                 id: limit_text(id, 48),
                 name: child_name(&meta.description, &meta.agent_type),
                 status: if finished { "done" } else { "working" }.into(),
                 age,
                 activity: activity(&meta.description),
+                quiet: at.saturating_sub(updated.max(written)),
             });
         }
     }
@@ -550,6 +587,7 @@ fn opencode_status(dir: &str, session_id: Option<&str>) -> (String, u64) {
             } else {
                 "working"
             };
+            let status = at_prompt_status(status, || opencode_jobs_running(&db, dir, session_id));
             if status == "error" {
                 (status.into(), age)
             } else {
@@ -558,6 +596,17 @@ fn opencode_status(dir: &str, session_id: Option<&str>) -> (String, u64) {
         }
         Err(_) => ("waiting".into(), 0),
     }
+}
+/// Whether a background command or subagent the session started is running.
+/// OpenCode keeps a `job` row for each until the session has been told it
+/// finished, and marks it running until then.
+fn opencode_jobs_running(db: &Connection, dir: &str, session: Option<&str>) -> bool {
+    db.query_row(
+        "WITH RECURSIVE scope(id) AS (SELECT id FROM session_v2 WHERE (?2 = '' AND directory = ?1) OR id = ?2 UNION SELECT c.id FROM session_v2 c JOIN scope s ON c.parent_id=s.id) SELECT EXISTS(SELECT 1 FROM job WHERE status='running' AND session_id IN (SELECT id FROM scope))",
+        [dir, session.unwrap_or("")],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
 }
 fn opencode_waits(db: &Connection, dir: &str, session: Option<&str>) -> waits::Evidence {
     let mut evidence = waits::Evidence::default();
@@ -647,6 +696,7 @@ fn opencode_children(session_id: &str) -> Vec<Child> {
             .into(),
             age,
             activity: activity(&title),
+            quiet: age,
         });
     }
     children.sort_by(|a, b| a.id.cmp(&b.id));
@@ -784,12 +834,21 @@ fn codex_children_at(db: &Connection, parent: &str, at: u64) -> Vec<Child> {
         if status != "working" && age > 120 {
             continue;
         }
+        // A working thread appends to its rollout as it goes; its age only
+        // counts from the start of its turn.
+        let written = fs::metadata(&child.thread.rollout_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|t| t.as_secs())
+            .unwrap_or(0);
         children.push(Child {
             id: limit_text(&child.thread.id, 48),
             name: child_name(&child.label, "Subagent"),
             status: status.into(),
             age,
             activity: activity(&child.label),
+            quiet: at.saturating_sub(written),
         });
     }
     // Active workers must not be displaced by recently completed siblings.
@@ -856,6 +915,75 @@ fn codex_lifecycle(event: RolloutEvent, at: u64) -> Option<(&'static str, u64)> 
         status,
         at.saturating_sub(timestamp.timestamp().max(0) as u64),
     ))
+}
+/// Commands Codex left running as background terminals: a command result that
+/// returned a terminal ID instead of an exit code, with no record yet of that
+/// terminal ending. Each is (call started, result returned).
+fn codex_background(values: &[serde_json::Value]) -> Vec<(u64, u64)> {
+    fn terminals(v: &serde_json::Value, found: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                // A command result, not some other JSON that has the key.
+                if map.contains_key("wall_time_seconds") && !map.contains_key("exit_code") {
+                    if let Some(id) = map.get("session_id").and_then(|id| id.as_u64()) {
+                        found.push(id.to_string());
+                    }
+                }
+                map.values().for_each(|v| terminals(v, found));
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|v| terminals(v, found)),
+            _ => (),
+        }
+    }
+    let at = |v: &serde_json::Value| {
+        chrono::DateTime::parse_from_rfc3339(v["timestamp"].as_str()?)
+            .ok()
+            .map(|t| t.timestamp().max(0) as u64)
+    };
+    let mut calls = std::collections::HashMap::new();
+    let mut running: Vec<(String, u64, u64)> = vec![];
+    for v in values {
+        let p = &v["payload"];
+        match p["type"].as_str().unwrap_or("") {
+            "function_call" | "custom_tool_call" => {
+                if let (Some(id), Some(time)) = (p["call_id"].as_str(), at(v)) {
+                    calls.insert(id.to_string(), time);
+                }
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                let Some(returned) = at(v) else { continue };
+                let started = p["call_id"]
+                    .as_str()
+                    .and_then(|id| calls.get(id).copied())
+                    .unwrap_or(returned);
+                // Results are text, often holding the command's JSON per line.
+                let texts: Vec<&str> = match &p["output"] {
+                    serde_json::Value::String(text) => vec![text.as_str()],
+                    serde_json::Value::Array(items) => {
+                        items.iter().filter_map(|i| i["text"].as_str()).collect()
+                    }
+                    _ => vec![],
+                };
+                let mut found = vec![];
+                for line in texts.iter().flat_map(|t| t.lines()) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                        terminals(&json, &mut found);
+                    }
+                }
+                for id in found {
+                    // Polling a terminal reports it again; it started earlier.
+                    if !running.iter().any(|(known, ..)| *known == id) {
+                        running.push((id, started, returned));
+                    }
+                }
+            }
+            "item_completed" if p["item"]["type"] == "CommandExecution" => {
+                running.retain(|(id, ..)| Some(id.as_str()) != p["item"]["process_id"].as_str());
+            }
+            _ => (),
+        }
+    }
+    running.into_iter().map(|(_, from, to)| (from, to)).collect()
 }
 /// The newest tool call of the current turn still waiting for its result.
 fn codex_pending_call(values: &[serde_json::Value]) -> Option<(String, u64)> {
@@ -926,9 +1054,9 @@ fn started_for_call(started: u64, since: u64) -> bool {
 fn codex_process_started_since(since: u64) -> bool {
     process_started_since(since, &["codex"])
 }
-/// Whether a process descending from one of the named agents started at or
-/// after `since`. Older ones (MCP servers, say) can't be running this tool call.
-fn process_started_since(since: u64, agents: &[&str]) -> bool {
+/// When the system booted, in seconds since the epoch, and the clock tick rate
+/// that process start times are counted in.
+fn boot_clock() -> (u64, u64) {
     let boot = fs::read_to_string("/proc/stat")
         .ok()
         .and_then(|s| {
@@ -936,8 +1064,37 @@ fn process_started_since(since: u64, agents: &[&str]) -> bool {
                 .find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok())
         })
         .unwrap_or(0);
-    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
-    // pid -> (parent, started at, is codex)
+    (boot, unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64)
+}
+/// A process's parent, start time (seconds since the epoch) and command name,
+/// unless it has exited and is only waiting to be reaped.
+fn process_info(pid: u32, (boot, ticks): (u64, u64)) -> Option<(u32, u64, String)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name may contain spaces, so split after its closing ")".
+    let (head, rest) = stat.rsplit_once(") ")?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if fields.first() == Some(&"Z") {
+        return None;
+    }
+    let parent = fields.get(1)?.parse().ok()?;
+    let start: u64 = fields.get(19)?.parse().ok()?;
+    let name = head.split_once('(')?.1.to_string();
+    Some((parent, boot + start / ticks, name))
+}
+/// When a process started, in seconds since the epoch.
+pub(crate) fn process_start(pid: u32) -> Option<u64> {
+    process_info(pid, boot_clock()).map(|(_, started, _)| started)
+}
+/// Whether this process is still running and is the one started during a tool
+/// call from `from` to `to`, not a later one that reused its ID.
+pub(crate) fn process_alive_since(pid: u32, from: u64, to: u64) -> bool {
+    process_start(pid).is_some_and(|started| started_for_call(started, from) && started <= to + 5)
+}
+/// Start times of the running processes descending from one of the named
+/// agents, the agents themselves excluded.
+fn agent_commands(agents: &[&str]) -> Vec<u64> {
+    let clock = boot_clock();
+    // pid -> (parent, started at, is one of the agents)
     let mut procs = std::collections::HashMap::new();
     for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
         let Some(pid) = entry
@@ -947,41 +1104,63 @@ fn process_started_since(since: u64, agents: &[&str]) -> bool {
         else {
             continue;
         };
-        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        // The command name may contain spaces, so split after its closing ")".
-        let Some((head, rest)) = stat.rsplit_once(") ") else {
-            continue;
-        };
-        let fields: Vec<&str> = rest.split_whitespace().collect();
-        let (Some(parent), Some(start)) = (
-            fields.get(1).and_then(|f| f.parse::<u32>().ok()),
-            fields.get(19).and_then(|f| f.parse::<u64>().ok()),
-        ) else {
-            continue;
-        };
-        procs.insert(
-            pid,
-            (parent, boot + start / ticks, agents.iter().any(|a| head.ends_with(&format!("({a}")))),
-        );
+        if let Some((parent, started, name)) = process_info(pid, clock) {
+            procs.insert(pid, (parent, started, agents.contains(&name.as_str())));
+        }
     }
-    procs.iter().any(|(pid, (_, started, is_codex))| {
-        if *is_codex || !started_for_call(*started, since) {
-            return false;
-        }
-        let mut current = *pid;
-        for _ in 0..64 {
-            let Some((parent, _, codex)) = procs.get(&current) else {
+    procs
+        .iter()
+        .filter(|(pid, (_, _, agent))| {
+            if *agent {
                 return false;
-            };
-            if *codex {
-                return true;
             }
-            current = *parent;
-        }
-        false
-    })
+            let mut current = **pid;
+            for _ in 0..64 {
+                let Some((parent, _, agent)) = procs.get(&current) else {
+                    return false;
+                };
+                if *agent {
+                    return true;
+                }
+                current = *parent;
+            }
+            false
+        })
+        .map(|(_, (_, started, _))| *started)
+        .collect()
+}
+/// Whether a process descending from one of the named agents started at or
+/// after `since`. Older ones (MCP servers, say) can't be running this tool call.
+fn process_started_since(since: u64, agents: &[&str]) -> bool {
+    agent_commands(agents)
+        .into_iter()
+        .any(|started| started_for_call(started, since))
+}
+/// Whether a process one of the named agents started during a tool call, from
+/// `from` until its result at `to`, is still running.
+pub(crate) fn process_started_during(from: u64, to: u64, agents: &[&str]) -> bool {
+    agent_commands(agents)
+        .into_iter()
+        .any(|started| started_for_call(started, from) && started <= to + 5)
+}
+/// A subagent quiet for longer than this is treated as stalled: one that was
+/// killed may never be marked finished.
+const SUBAGENT_QUIET_LIMIT: u64 = 1800;
+/// Whether a session back at its prompt still has a subagent at work.
+pub(crate) fn subagents_busy(children: &[Child]) -> bool {
+    children
+        .iter()
+        .any(|c| c.status == "working" && c.quiet <= SUBAGENT_QUIET_LIMIT)
+}
+/// A session back at its prompt that is still running work it started, a
+/// background command or a subagent, is waiting on that work rather than on
+/// you. Questions and permission prompts are checked afterwards and win.
+pub(crate) fn at_prompt_status(status: &str, work_running: impl FnOnce() -> bool) -> &str {
+    if matches!(status, "waiting" | "idle") && work_running() {
+        "waiting_task"
+    } else {
+        status
+    }
 }
 fn codex_status(path: &Path) -> (String, u64) {
     let (status, age) = codex_rollout_status(path, now()).unwrap_or(("waiting", 0));
@@ -1134,12 +1313,24 @@ fn process_sessions() -> Vec<Agent> {
                 .as_ref()
                 .map(|thread| codex_status(&thread.rollout_path))
                 .unwrap_or_else(|| ("waiting".into(), 0));
+            let values = codex
+                .as_ref()
+                .and_then(|thread| {
+                    usage::tail_values(&thread.rollout_path, 256 * 1024, b"\"payload\"")
+                })
+                .map(|(values, _)| values)
+                .unwrap_or_default();
+            let status = at_prompt_status(&status, || {
+                subagents_busy(&children)
+                    || codex_background(&values)
+                        .into_iter()
+                        .any(|(from, to)| process_started_during(from, to, &["codex"]))
+            })
+            .to_string();
             let stopped = codex
                 .as_ref()
                 .filter(|_| status == "working")
-                .and_then(|thread| {
-                    let (values, _) =
-                        usage::tail_values(&thread.rollout_path, 256 * 1024, b"\"payload\"")?;
+                .and_then(|_| {
                     codex_stopped_on_user(
                         codex_pending_call(&values).as_ref(),
                         now(),
@@ -1151,13 +1342,11 @@ fn process_sessions() -> Vec<Agent> {
                 Some(waited) => ("waiting".into(), waited),
                 None => (status, age),
             };
-            codex
-                .as_ref()
-                .and_then(|thread| {
-                    usage::tail_values(&thread.rollout_path, 256 * 1024, b"\"payload\"")
-                })
-                .map(|(values, _)| waits::codex(&values).resolve((&base.0, base.1), now()))
-                .unwrap_or(base)
+            if codex.is_some() {
+                waits::codex(&values).resolve((&base.0, base.1), now())
+            } else {
+                base
+            }
         };
         let codex_usage = codex
             .as_ref()
@@ -1213,6 +1402,7 @@ fn collect(demo: bool) -> Vec<Agent> {
                         status: "working".into(),
                         age: 42,
                         activity: activity("Inspecting the display"),
+                        quiet: 0,
                     }]
                 } else {
                     vec![]
@@ -1647,6 +1837,19 @@ mod tests {
         assert_eq!(activity(" \n "), None);
     }
     #[test]
+    fn claude_waiting_on_a_background_shell_is_waiting_task() {
+        let record = |json: &str| serde_json::from_str::<Claude>(json).unwrap();
+        let shell = record(r#"{"pid":1,"status":"shell"}"#);
+        assert_eq!(shell.base_status(60), "waiting_task");
+        // Still running hours later: a long check isn't an abandoned prompt.
+        assert_eq!(shell.base_status(9000), "waiting_task");
+        // A question or permission prompt still comes first.
+        let asking = record(r#"{"pid":1,"status":"shell","waitingFor":"permission"}"#);
+        assert_eq!(asking.base_status(60), "waiting");
+        assert_eq!(record(r#"{"pid":1,"status":"idle"}"#).base_status(60), "waiting");
+        assert_eq!(record(r#"{"pid":1,"status":"busy"}"#).base_status(60), "working");
+    }
+    #[test]
     fn opencode_tabs_keep_distinct_titles_and_ids() {
         let file: TabsFile = serde_json::from_str(r#"{"cwd":{"/project":{"tabs":[{"sessionID":"one","title":"First"},{"sessionID":"two","title":"Second"}]}}}"#).unwrap();
         assert_eq!(file.cwd["/project"].tabs.len(), 2);
@@ -1877,6 +2080,15 @@ mod tests {
                 "agent-finished.meta.json",
                 r#"{"description":"Finished","finished":true}"#,
             ),
+            // A forked skill's companion files aren't more subagents.
+            (
+                "agent-running.forked-skill.json",
+                r#"{"skillName":"code-review"}"#,
+            ),
+            (
+                "agent-running.forked-skill.marker.json",
+                r#"{"forkedSkill":true}"#,
+            ),
         ] {
             let path = dir.join(name);
             fs::write(&path, body).unwrap();
@@ -1889,8 +2101,19 @@ mod tests {
                 )
                 .unwrap();
         }
+        // The running subagent's transcript shows its latest activity.
+        let transcript = dir.join("agent-running.jsonl");
+        fs::write(&transcript, "{}").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1110)))
+            .unwrap();
         let recent = claude_children_at("session", &root, 1120);
         assert_eq!(recent.len(), 4);
+        let running = recent.iter().find(|c| c.name == "Running").unwrap();
+        assert_eq!(running.quiet, 10);
         for child in &recent {
             assert_eq!(child.age, 120);
             assert_eq!(
@@ -1907,6 +2130,75 @@ mod tests {
         assert_eq!(expired[0].name, "Running");
         assert_eq!(expired[0].status, "working");
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn work_left_running_turns_a_prompt_into_waiting_task() {
+        assert_eq!(at_prompt_status("waiting", || true), "waiting_task");
+        assert_eq!(at_prompt_status("idle", || true), "waiting_task");
+        assert_eq!(at_prompt_status("waiting", || false), "waiting");
+        // Mid-turn or failed: leftover work isn't even looked for.
+        assert_eq!(at_prompt_status("working", || unreachable!()), "working");
+        assert_eq!(at_prompt_status("error", || unreachable!()), "error");
+        let child = |status: &str, quiet| Child {
+            id: "c".into(),
+            name: "c".into(),
+            status: status.into(),
+            age: 0,
+            activity: None,
+            quiet,
+        };
+        assert!(subagents_busy(&[child("done", 0), child("working", 60)]));
+        assert!(!subagents_busy(&[child("done", 0)]));
+        // Quiet for too long: probably killed without being marked finished.
+        assert!(!subagents_busy(&[child("working", SUBAGENT_QUIET_LIMIT + 1)]));
+    }
+    #[test]
+    fn a_command_counts_only_while_its_own_process_runs() {
+        let me = fs::read_to_string("/proc/self/stat").unwrap();
+        let name = me.rsplit_once(") ").unwrap().0.split_once('(').unwrap().1.to_string();
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let started = process_start(child.id()).unwrap();
+        assert!(process_alive_since(child.id(), started, started));
+        // A process started well after the call has only reused the ID.
+        assert!(!process_alive_since(child.id(), started + 60, started + 60));
+        assert!(process_started_during(started, started, &[name.as_str()]));
+        assert!(!process_started_during(started + 60, started + 70, &[name.as_str()]));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!process_alive_since(child.id(), started, started));
+    }
+    #[test]
+    fn codex_terminals_run_until_their_end_is_recorded() {
+        use serde_json::json;
+        let call = |at: &str, id: &str| json!({"timestamp":at,"type":"response_item","payload":{"type":"custom_tool_call","call_id":id,"name":"exec"}});
+        let result = |at: &str, id: &str, text: &str| json!({"timestamp":at,"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":id,"output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":text}]}});
+        let mut values = vec![
+            call("2026-11-12T10:00:00Z", "a"),
+            result("2026-11-12T10:00:10Z", "a", r#"{"i":0,"result":{"status":"fulfilled","value":{"chunk_id":"1","wall_time_seconds":10.0,"session_id":75586,"output":""}}}"#),
+            // Finished commands, and JSON that merely has the key, don't count.
+            call("2026-11-12T10:00:20Z", "b"),
+            result("2026-11-12T10:00:21Z", "b", "{\"chunk_id\":\"2\",\"wall_time_seconds\":0.1,\"session_id\":5,\"exit_code\":0}\n{\"session_id\":7}"),
+            // Polling reports the terminal again; it still started with the first call.
+            call("2026-11-12T10:05:00Z", "c"),
+            result("2026-11-12T10:05:01Z", "c", r#"{"chunk_id":"3","wall_time_seconds":1.0,"session_id":75586,"output":""}"#),
+        ];
+        let start = chrono::DateTime::parse_from_rfc3339("2026-11-12T10:00:00Z").unwrap().timestamp() as u64;
+        assert_eq!(codex_background(&values), vec![(start, start + 10)]);
+        values.push(json!({"timestamp":"2026-11-12T10:30:00Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","process_id":"75586","exit_code":0}}}));
+        assert!(codex_background(&values).is_empty());
+    }
+    #[test]
+    fn opencode_running_jobs_of_a_session_or_its_subagents_count() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE session_v2 (id TEXT,directory TEXT,parent_id TEXT); INSERT INTO session_v2 VALUES ('s','/p',NULL),('child','/p','s'),('other','/q',NULL);").unwrap();
+        // Older databases have no job table: nothing running, no failure.
+        assert!(!opencode_jobs_running(&db, "/p", Some("s")));
+        db.execute_batch("CREATE TABLE job (session_id TEXT,status TEXT); INSERT INTO job VALUES ('child','completed');").unwrap();
+        assert!(!opencode_jobs_running(&db, "/p", Some("s")));
+        db.execute("INSERT INTO job VALUES ('child','running')", []).unwrap();
+        assert!(opencode_jobs_running(&db, "/p", Some("s")));
+        assert!(opencode_jobs_running(&db, "/p", None));
+        assert!(!opencode_jobs_running(&db, "/q", Some("other")));
     }
     #[test]
     fn idle_detached_jobs_stay_visible_but_parked_shells_do_not() {

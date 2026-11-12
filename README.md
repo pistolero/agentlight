@@ -44,7 +44,7 @@ Each session is a card, colored by status:
 |---|---|---|
 | **WORKING** | Green | The agent is busy |
 | **NEEDS YOU** | Amber | It's waiting for your input or permission |
-| **WAITING TASK** | Blue | It's blocked on a command, task or worker it started |
+| **WAITING TASK** | Blue | It's waiting on a command, task or subagent it started, including one left running in the background |
 | **ERROR** | Red | Its last turn failed |
 | **IDLE** | Gray | Nothing has happened for 2 hours |
 
@@ -199,6 +199,7 @@ Some things can't be read directly:
 
 - **Codex and Kilo don't record permission prompts** where Agentlight can see them. A session counts as waiting when a command-type tool has had no result for 30 seconds, no process has started for it, and no subagent is active. So a prompt can take up to 30 seconds to appear, and another busy session can occasionally hide one.
 - **Kilo doesn't record which terminal owns which session.** With several terminals in one folder, Agentlight pairs them in start order, which can be wrong if you switch sessions inside a terminal. A lone terminal follows its folder's most active session, as long as that session is newer than the terminal.
+- **Work left running in the background** keeps a finished turn on WAITING TASK rather than NEEDS YOU. Claude Code reports a running background command itself. For Codex and Kilo, Agentlight checks that the command's process is still alive, and OpenCode records its running jobs. A subagent quiet for 30 minutes stops counting, in case it was killed. A server left running on purpose also keeps its session on WAITING TASK.
 - **After a session goes quiet,** it shows NEEDS YOU for 2 hours and then IDLE, so an alert nobody answers ends by itself.
 - **A new session counts as needing you,** because it's waiting for your first message.
 

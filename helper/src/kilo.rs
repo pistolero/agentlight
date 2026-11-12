@@ -100,6 +100,65 @@ fn parent(db: &Connection, dir: &str, session: Option<&str>) -> Option<(String, 
     db.query_row("SELECT id,title FROM session WHERE directory=?1 AND parent_id IS NULL AND time_archived IS NULL AND (?2='' OR id=?2) ORDER BY time_updated DESC,time_created DESC,id DESC LIMIT 1",[dir,session.unwrap_or("")],|r| Ok((r.get(0)?,r.get(1)?))).ok()
 }
 fn status(db: &Connection, session: &str, at: u64) -> Option<(String, u64)> {
+    status_with(db, session, at, false)
+}
+/// A command the session started with `background_process`, last recorded as
+/// still running. Kilo doesn't record when one exits by itself.
+#[derive(Debug, PartialEq)]
+struct Background {
+    pid: Option<u32>,
+    from: u64,
+    to: u64,
+}
+fn background_commands(db: &Connection, session: &str) -> Vec<Background> {
+    let Ok(mut query) = db.prepare("SELECT json_extract(data,'$.state.metadata.processID'),coalesce(json_extract(data,'$.state.metadata.status'),''),substr(coalesce(json_extract(data,'$.state.output'),''),1,2000),coalesce(json_extract(data,'$.state.time.start'),time_created),coalesce(json_extract(data,'$.state.time.end'),time_updated) FROM part WHERE session_id=?1 AND json_extract(data,'$.type')='tool' AND json_extract(data,'$.tool')='background_process' AND json_extract(data,'$.state.status')='completed' AND json_extract(data,'$.state.metadata.processID') IS NOT NULL ORDER BY time_created,id") else {
+        return vec![];
+    };
+    let Ok(rows) = query.query_map([session], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, u64>(3)?,
+            r.get::<_, u64>(4)?,
+        ))
+    }) else {
+        return vec![];
+    };
+    // processID -> (latest status, process, first call)
+    let mut seen: Vec<(String, String, Background)> = vec![];
+    for (id, state, output, from, to) in rows.flatten() {
+        // `start` and `status` report the process ID; `monitor` doesn't.
+        let pid = output
+            .lines()
+            .find_map(|l| l.strip_prefix("pid: ")?.trim().parse::<u32>().ok());
+        match seen.iter_mut().find(|(known, ..)| *known == id) {
+            Some((_, latest, call)) => {
+                *latest = state;
+                call.pid = call.pid.or(pid);
+            }
+            None => seen.push((id, state, Background { pid, from: from / 1000, to: to / 1000 })),
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, state, _)| state == "running")
+        .map(|(.., call)| call)
+        .collect()
+}
+/// Whether a background command is really still running: its own process if
+/// its ID is known, or else one Kilo started during that call.
+fn still_running(call: &Background) -> bool {
+    match call.pid {
+        Some(pid) => crate::process_alive_since(pid, call.from, call.to),
+        None => crate::process_started_during(call.from, call.to, &[".kilo", "kilo"]),
+    }
+}
+fn status_with(
+    db: &Connection,
+    session: &str,
+    at: u64,
+    subagents_busy: bool,
+) -> Option<(String, u64)> {
     let (role,error,completed,finish,updated): (String,String,Option<u64>,String,u64) = db.query_row(
         "SELECT coalesce(json_extract(data,'$.role'),''),coalesce(json_extract(data,'$.error.name'),''),json_extract(data,'$.time.completed'),coalesce(json_extract(data,'$.finish'),''),time_updated FROM message WHERE session_id=?1 ORDER BY time_created DESC,id DESC LIMIT 1",
         [session],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).ok()?;
@@ -116,6 +175,9 @@ fn status(db: &Connection, session: &str, at: u64) -> Option<(String, u64)> {
     } else {
         "working"
     };
+    let base = crate::at_prompt_status(base, || {
+        subagents_busy || background_commands(db, session).iter().any(still_running)
+    });
     Some(if base == "error" {
         (base.into(), age)
     } else {
@@ -178,6 +240,7 @@ fn children(db: &Connection, parent: &str, at: u64) -> Vec<Child> {
             .into(),
             age,
             activity: activity(&title),
+            quiet: age,
         });
     }
     children.sort_by(|a, b| (a.status != "working", &a.id).cmp(&(b.status != "working", &b.id)));
@@ -186,7 +249,9 @@ fn children(db: &Connection, parent: &str, at: u64) -> Vec<Child> {
 }
 fn agent(db: &Connection, pid: u32, dir: &str, selected: Option<&str>, at: u64) -> Option<Agent> {
     let (session, title) = parent(db, dir, selected)?;
-    let (status, age) = status(db, &session, at).unwrap_or_else(|| {
+    let children = children(db, &session, at);
+    let busy = crate::subagents_busy(&children);
+    let (status, age) = status_with(db, &session, at, busy).unwrap_or_else(|| {
         let updated: u64 = db
             .query_row(
                 "SELECT time_updated FROM session WHERE id=?1",
@@ -198,7 +263,6 @@ fn agent(db: &Connection, pid: u32, dir: &str, selected: Option<&str>, at: u64) 
         (if age >= 7200 { "idle" } else { "waiting" }.into(), age)
     });
     // Kilo doesn't store permission prompts, so infer one from a stalled tool.
-    let children = children(db, &session, at);
     let stopped = (status == "working")
         .then(|| {
             crate::codex_stopped_on_user(
@@ -283,22 +347,6 @@ fn session_for_terminal(db: &Connection, dir: &str, pid: u32) -> Option<String> 
         .into_iter()
         .nth(place)
 }
-/// When a process started, in seconds since the epoch.
-fn process_started(pid: u32) -> Option<u64> {
-    let boot = fs::read_to_string("/proc/stat")
-        .ok()?
-        .lines()
-        .find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok())?;
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let start: u64 = stat
-        .rsplit_once(") ")?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()?;
-    Some(boot + start / unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64)
-}
 /// `-s` only names the session a terminal opened on. Implementing a plan or
 /// starting afresh moves the terminal to a new session, and Kilo doesn't record
 /// that. So follow the directory's most active session if it was created after
@@ -329,7 +377,7 @@ pub fn collect(pid: u32, dir: &str, args: &[&str]) -> Option<Agent> {
     let opened = opened_session(&db, dir, args);
     // With other terminals in the directory, a new session could be theirs.
     let followed = opened.as_deref().filter(|_| terminals(dir).len() == 1).and_then(|o| {
-        followed_session(&db, dir, o, process_started(pid)?)
+        followed_session(&db, dir, o, crate::process_start(pid)?)
     });
     let selected = followed
         .clone()
@@ -436,6 +484,50 @@ mod tests {
             rusqlite::params![id, message, session, at, data.to_string()],
         )
         .unwrap();
+    }
+    fn background(action: &str, id: &str, state: &str, output: &str, start: u64) -> serde_json::Value {
+        json!({"type":"tool","tool":"background_process","state":{"status":"completed","input":{"action":action},"output":output,"metadata":{"processID":id,"status":state},"time":{"start":start,"end":start+2000}}})
+    }
+    #[test]
+    fn background_commands_keep_their_latest_state_and_process() {
+        let db = db();
+        let parts = [
+            ("start", "bgp_a", "running", "id: bgp_a\nstatus: running\npid: 4242\n", "s"),
+            ("logs", "bgp_a", "running", "Compiling", "s"),
+            ("start", "bgp_b", "running", "id: bgp_b\npid: 4343", "s"),
+            ("stop", "bgp_b", "stopped", "pid: 4343", "s"),
+            // `monitor` returns while the command runs on, without its process ID.
+            ("monitor", "bgp_c", "running", "[the process is still running]\nprocess id: bgp_c", "s"),
+            ("start", "bgp_d", "running", "pid: 4444", "other"),
+        ];
+        for (i, (action, id, state, output, session)) in parts.into_iter().enumerate() {
+            let at = (i as u64 + 1) * 1_000_000;
+            part(&db, &i.to_string(), "m", session, at, background(action, id, state, output, at));
+        }
+        assert_eq!(
+            background_commands(&db, "s"),
+            vec![
+                Background { pid: Some(4242), from: 1000, to: 1002 },
+                Background { pid: None, from: 5000, to: 5002 },
+            ]
+        );
+    }
+    #[test]
+    fn a_turn_that_left_work_running_is_waiting_on_it() {
+        let db = db();
+        message(&db, "m", "s", 1_000_000, json!({"role":"assistant","time":{"completed":1_000_000},"finish":"stop"}));
+        assert_eq!(status(&db, "s", 1100).unwrap().0, "waiting");
+        let mut command = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let started = crate::process_start(command.id()).unwrap();
+        let output = format!("id: bgp_x\nstatus: running\npid: {}", command.id());
+        part(&db, "p", "m", "s", started * 1000, background("start", "bgp_x", "running", &output, started * 1000));
+        assert_eq!(status(&db, "s", 1100).unwrap().0, "waiting_task");
+        command.kill().unwrap();
+        command.wait().unwrap();
+        // It exited without Kilo recording it: the process tells.
+        assert_eq!(status(&db, "s", 1100).unwrap().0, "waiting");
+        // A subagent still at work counts too.
+        assert_eq!(status_with(&db, "s", 1100, true).unwrap().0, "waiting_task");
     }
     #[test]
     fn commands_and_paths_do_not_mix_kilo_with_its_daemon_or_opencode() {
